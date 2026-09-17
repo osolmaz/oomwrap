@@ -1,20 +1,27 @@
 # oomwrap
 
 <p align="center">
-  <img src="assets/cover.svg" alt="oomwrap: one command enters a process-scoped wrapper that watches RAM and swap floors and stops the owned process group with SIGTERM then SIGKILL before the host freezes" width="880">
+  <img src="assets/cover.svg" alt="oomwrap wraps an agent-launched inference server, watches RAM and swap floors, and stops its process group before the machine freezes" width="880">
 </p>
 
-oomwrap is a Linux command-line tool for process-scoped memory protection. It
-checks available RAM and swap before it starts one command, then stops that
-command's process group if either configured floor is crossed.
+oomwrap is a Linux command-line guard for agents that launch local inference
+engines and other memory-heavy jobs. It wraps one command, watches available RAM
+and swap, and stops the owned process group before memory pressure freezes the
+machine.
 
-Use it for any local workload that can exhaust memory, such as a large build,
-renderer, data conversion, model load, or inference server. oomwrap complements
+Use it when an agent starts vLLM, SGLang, llama.cpp, or another inference
+engine. It also protects builds, renderers, and data jobs. oomwrap complements
 machine-wide tools such as `earlyoom`; it does not replace them.
 
 ## Install
 
-Install oomwrap from GitHub:
+Install oomwrap from crates.io:
+
+```bash
+cargo install oomwrap --locked
+```
+
+Install the latest `main` branch from GitHub:
 
 ```bash
 cargo install --git https://github.com/osolmaz/oomwrap --locked
