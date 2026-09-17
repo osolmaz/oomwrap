@@ -51,10 +51,23 @@ crosses a floor, oomwrap sends `SIGTERM`, waits for the configured grace period,
 and then sends `SIGKILL` to the remaining process group. A pressure stop returns
 exit code `137`.
 
-## Inference example
+## Use with earlyoom
 
-Inference profiles recognize common local engines and require active `earlyoom`
-by default:
+`oomwrap` and [`earlyoom`](https://github.com/rfjakob/earlyoom) protect different
+parts of the machine:
+
+- `oomwrap` watches the process group that it starts. It uses explicit available
+  RAM and free swap floors, and it stops only that process group.
+- `earlyoom` watches the whole machine. It remains a last line of defense when
+  any process causes system-wide memory pressure.
+
+Use both on a workstation. `oomwrap doctor` reports whether `earlyoom` is
+active. oomwrap does not install or configure `earlyoom`.
+
+## Run inference engines
+
+Choose the profile that matches the inference engine, then put the engine
+command after `--`:
 
 ```bash
 oomwrap run \
@@ -65,8 +78,9 @@ oomwrap run \
 ```
 
 Supported profiles are `auto`, `vllm`, `llama-cpp`, `sglang`, `trtllm`, `tgi`,
-and `generic`. Use `generic` for other commands. Use `--allow-no-earlyoom` only
-for tests or controlled machines with another machine-wide safety mechanism.
+and `generic`. The inference profiles require active `earlyoom` by default. Use
+`generic` for other commands. Use `--allow-no-earlyoom` only for tests or a
+controlled machine that has another machine-wide safety mechanism.
 
 ## Event logs
 
