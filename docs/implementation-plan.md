@@ -1,212 +1,118 @@
-# infer-guard Implementation Plan
+# oomwrap implementation plan
 
 ## Goal
 
-Build a small Rust CLI that makes local LLM inference launches hard to OOM.
-It should protect humans, agents, benchmark harnesses, and shell scripts that
-start vLLM, llama.cpp, SGLang, TensorRT-LLM, TGI, Ollama, LM Studio CLI, or
-similar local serving processes.
+Build a small Rust CLI that runs one local command under process-scoped RAM and
+swap protection. It must protect interactive machines from large builds,
+renderers, data jobs, model loads, inference servers, and similar workloads.
 
-The default path should be automatic: after shims are installed, existing
-commands such as `vllm serve ...` or configured runtime entrypoints run through
-the guard without users remembering a special wrapper.
-
-## Non-Goals
-
-- Do not replace earlyoom. Use it as the machine-wide safety net.
-- Do not create a persistent service by default.
-- Do not silently delete caches, Docker state, model weights, or user files.
-- Do not hide remote endpoint auth failures by falling back to local inference.
-- Do not tune model quality or inference performance policy.
-
-## Core Design
-
-`infer-guard run -- <command>` is the primitive.
-
-It should:
-
-- verify the intended command is local inference, not a mistaken fallback for a
-  remote API target
-- require active `earlyoom` by default for high-risk profiles
-- preflight `/proc/meminfo`, swap, disk, and existing inference processes
-- launch the child in a new process group
-- optionally launch inside a transient user cgroup/scope
-- monitor `MemAvailable`, `SwapFree`, child liveness, and process tree RSS
-- send `SIGTERM`, then `SIGKILL`, to the whole process group on pressure
-- write structured JSON event logs explaining launches, kills, and exits
-- return `137` when it kills a workload for memory pressure
-
-## CLI Surface
-
-Initial commands:
+The primitive is:
 
 ```bash
-infer-guard doctor
-infer-guard run [options] -- <command> [args...]
-infer-guard install-shims [options]
-infer-guard uninstall-shims [options]
-infer-guard wrap <path>
-infer-guard unwrap <path>
-infer-guard inspect
+oomwrap run [options] -- <command> [args...]
 ```
 
-Useful run options:
+## Non-goals
+
+- Do not replace `earlyoom` or another machine-wide safety mechanism.
+- Do not install a persistent service by default.
+- Do not delete caches, images, model weights, build outputs, or user files.
+- Do not tune the child workload for performance or quality.
+- Do not claim that a supervised command cannot trigger a driver or kernel fault.
+
+## Core design
+
+`oomwrap run`:
+
+- reads `/proc/meminfo` before launch;
+- checks configured available-RAM and free-swap floors;
+- starts the child in a new process group;
+- forwards terminal signals;
+- monitors the child and both memory floors;
+- sends `SIGTERM`, then `SIGKILL`, to the process group on pressure;
+- writes optional JSON Lines events for launches, refusals, pressure stops, and
+  exits;
+- returns `137` when it stops a group for memory pressure.
+
+A `generic` profile supports any command. Inference profiles add command
+detection and require active `earlyoom` by default because large local model
+loads can also create driver-level allocation pressure.
+
+## CLI surface
+
+```bash
+oomwrap doctor
+oomwrap inspect
+oomwrap run [options] -- <command> [args...]
+oomwrap install-shims [options]
+oomwrap uninstall-shims [options]
+oomwrap wrap <path>
+oomwrap unwrap <path>
+```
+
+Important run options:
 
 ```text
---profile vllm|llama-cpp|sglang|trtllm|tgi|generic
+--profile auto|vllm|llama-cpp|sglang|trtllm|tgi|generic
 --min-mem 24G
 --min-swap 4G
 --poll 1s
 --term-grace 10s
---require-earlyoom / --allow-no-earlyoom
+--require-earlyoom | --allow-no-earlyoom
 --event-log PATH
---use-systemd-scope
---memory-high SIZE
---memory-max SIZE
 ```
 
-Environment overrides for shims:
+The shim and wrapper environment uses the `OOMWRAP_*` prefix.
 
-```text
-INFER_GUARD_MIN_MEM
-INFER_GUARD_MIN_SWAP
-INFER_GUARD_PROFILE
-INFER_GUARD_EVENT_LOG
-INFER_GUARD_REAL_<TOOL>
-```
+## Adoption paths
 
-## Automatic Adoption
+General commands call `oomwrap run` directly.
 
-There are two adoption layers.
+Inference runtimes can also use PATH shims for known executable names or an
+in-place wrapper for a fixed executable path. The original executable is kept as
+a sidecar and `oomwrap unwrap` restores it exactly.
 
-PATH shims:
+No shim or wrapper is installed without an explicit command.
 
-```text
-~/.local/bin/vllm
-~/.local/bin/llama-server
-~/.local/bin/llama-cli
-~/.local/bin/sglang
-~/.local/bin/trtllm-serve
-~/.local/bin/text-generation-launcher
-```
+## Safety boundaries
 
-These resolve the real executable later in `PATH` and run it through
-`infer-guard run`.
+The guard rejects a launch when the configured memory or swap floor already
+fails. High-risk inference profiles reject a launch when `earlyoom` is required
+but not active. The `generic` profile lets the operator select the needed
+machine-wide policy explicitly.
 
-Absolute runtime wrappers:
-
-```bash
-infer-guard wrap ~/runtimes/vllm/current/.venv/bin/vllm
-```
-
-This moves the target to `vllm.real` and replaces `vllm` with a generated
-wrapper. Use this for benchmark scripts that call canonical runtime paths
-directly.
-
-`infer-guard unwrap` must restore the original binary exactly.
-
-## Safety Policy
-
-Defaults for interactive GPU workstations:
-
-```text
-min_mem = 24G
-min_swap = 4G
-poll = 1s
-term_grace = 10s
-require_earlyoom = true
-```
-
-The guard should refuse a launch when:
-
-- earlyoom is required but not running
-- available memory or swap is already below the configured floor
-- another local inference process is already consuming unsafe memory
-- the command looks like a local fallback for an intended remote endpoint
-- disk is too tight for known compile/model cache growth
-
-The guard may warn, but should not block, for unknown command names when the user
-explicitly selects `--profile generic`.
-
-## Cgroup Integration
-
-Phase one should work without systemd or root privileges.
-
-Phase two should support:
-
-```bash
-systemd-run --user --scope
-```
-
-with optional `MemoryHigh` and `MemoryMax` properties. This is an additional
-containment layer, not a replacement for process-group killing or earlyoom.
-
-No persistent system or user service should be installed unless a user
-explicitly asks for one.
-
-## Runtime Profiles
-
-Profiles encode command detection and default thresholds.
-
-Initial profiles:
-
-- `vllm`: `vllm`, `api_server`, `gpu_worker`, `python -m vllm`
-- `llama-cpp`: `llama-server`, `llama-cli`, `llama-bench`
-- `sglang`: `sglang`, `python -m sglang`
-- `trtllm`: `trtllm-serve`, TensorRT-LLM launchers
-- `tgi`: `text-generation-launcher`
-- `generic`: user-selected fallback with explicit thresholds
-
-Profiles should stay conservative. They are safety defaults, not performance
-tuning presets.
-
-## Packaging
-
-Primary package:
-
-- Rust binary published through GitHub Releases
-- install script that downloads the right release artifact
-- `cargo install` support for developers
-
-Later package targets:
-
-- Homebrew tap
-- Debian package
-- Arch package
-
-The install script should install only the binary by default. Shim installation
-must be an explicit `infer-guard install-shims` step.
+A guard error after the child starts must clean up the complete process group.
+Terminal foreground control must return to the caller after normal exit,
+pressure stop, interruption, or internal error.
 
 ## Testing
 
-Unit tests:
+Unit tests cover:
 
-- memory-size parsing
-- process tree discovery
-- shim generation
-- wrapper unwrap round trip
-- event log serialization
+- memory-size and duration parsing;
+- profile selection and command matching;
+- event serialization;
+- shim and wrapper generation;
+- process-state helpers.
 
-Integration tests:
+Integration tests cover:
 
-- child exits normally
-- child ignores `SIGTERM` and receives `SIGKILL`
-- guard kills a process group when a fake memory source crosses threshold
-- PATH shim resolves the real binary without recursing
-- in-place wrapper restores the exact original executable
+- normal and nonzero child exits;
+- signal exit codes;
+- preflight refusal;
+- pressure stops with fake memory input;
+- process-group cleanup;
+- signal forwarding;
+- PATH shim resolution without recursion;
+- wrapper and unwrap round trips;
+- required `earlyoom` behavior.
 
-Do not require real OOM conditions in CI. Use injectable memory readers and fake
-child processes.
+CI must not induce a real out-of-memory condition. Tests use fake memory files
+and bounded child processes.
 
-## Milestones
+## Packaging
 
-1. Rust project skeleton, `doctor`, config parsing, and CI.
-2. `run` with process group supervision and `/proc/meminfo` monitoring.
-3. JSON event logs and exit-code contract.
-4. PATH shim installer and uninstall flow.
-5. In-place wrap and unwrap flow for absolute runtime binaries.
-6. Profile detection for vLLM and llama.cpp.
-7. Optional `systemd-run --user --scope` integration.
-8. Release artifacts and installer.
-9. Update Codex/Claude skills to prefer the released binary over bundled shell
-   scripts.
+The current installation paths are `cargo install --git` and `cargo install
+--path`. A later release can add signed GitHub release artifacts and package
+manager integrations. Release work is separate from the rename and skill
+cutover.

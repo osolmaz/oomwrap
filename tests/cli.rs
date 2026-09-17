@@ -45,23 +45,23 @@ fn sh_quote(value: &str) -> String {
 
 #[test]
 fn doctor_prints_status() {
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
     cmd.arg("doctor");
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("infer-guard doctor"));
+        .stdout(predicate::str::contains("oomwrap doctor"));
 }
 
 #[test]
 fn doctor_and_inspect_can_emit_json() {
-    let mut doctor = Command::cargo_bin("infer-guard").unwrap();
+    let mut doctor = Command::cargo_bin("oomwrap").unwrap();
     doctor.args(["doctor", "--json"]);
     doctor
         .assert()
         .success()
         .stdout(predicate::str::contains("\"earlyoom_active\""));
 
-    let mut inspect = Command::cargo_bin("infer-guard").unwrap();
+    let mut inspect = Command::cargo_bin("oomwrap").unwrap();
     inspect.args(["inspect", "--json"]);
     inspect
         .assert()
@@ -71,16 +71,16 @@ fn doctor_and_inspect_can_emit_json() {
 
 #[test]
 fn inspect_prints_human_summary() {
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
     cmd.arg("inspect");
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("infer-guard inspect"));
+        .stdout(predicate::str::contains("oomwrap inspect"));
 }
 
 #[test]
 fn run_returns_child_exit_code() {
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
     cmd.args([
         "run",
         "--profile",
@@ -100,7 +100,7 @@ fn run_returns_child_exit_code() {
 
 #[test]
 fn run_returns_signal_exit_code() {
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
     cmd.args([
         "run",
         "--profile",
@@ -131,7 +131,7 @@ fn run_allows_child_to_read_from_controlling_tty() {
         return;
     }
 
-    let bin = Command::cargo_bin("infer-guard")
+    let bin = Command::cargo_bin("oomwrap")
         .unwrap()
         .get_program()
         .to_string_lossy()
@@ -188,8 +188,8 @@ fn run_allows_child_to_read_from_controlling_tty() {
 
 #[test]
 fn high_risk_profiles_require_earlyoom_unless_overridden() {
-    let mut present = Command::cargo_bin("infer-guard").unwrap();
-    present.env("INFER_GUARD_EARLYOOM_ACTIVE", "1");
+    let mut present = Command::cargo_bin("oomwrap").unwrap();
+    present.env("OOMWRAP_EARLYOOM_ACTIVE", "1");
     present.args([
         "run",
         "--profile",
@@ -205,8 +205,8 @@ fn high_risk_profiles_require_earlyoom_unless_overridden() {
     ]);
     present.assert().success();
 
-    let mut blocked = Command::cargo_bin("infer-guard").unwrap();
-    blocked.env("INFER_GUARD_EARLYOOM_ACTIVE", "0");
+    let mut blocked = Command::cargo_bin("oomwrap").unwrap();
+    blocked.env("OOMWRAP_EARLYOOM_ACTIVE", "0");
     blocked.args([
         "run",
         "--profile",
@@ -225,8 +225,8 @@ fn high_risk_profiles_require_earlyoom_unless_overridden() {
         .code(3)
         .stderr(predicate::str::contains("earlyoom is required"));
 
-    let mut python_module = Command::cargo_bin("infer-guard").unwrap();
-    python_module.env("INFER_GUARD_EARLYOOM_ACTIVE", "0");
+    let mut python_module = Command::cargo_bin("oomwrap").unwrap();
+    python_module.env("OOMWRAP_EARLYOOM_ACTIVE", "0");
     python_module.args([
         "run",
         "--min-mem",
@@ -244,8 +244,8 @@ fn high_risk_profiles_require_earlyoom_unless_overridden() {
         .code(3)
         .stderr(predicate::str::contains("earlyoom is required"));
 
-    let mut tgi = Command::cargo_bin("infer-guard").unwrap();
-    tgi.env("INFER_GUARD_EARLYOOM_ACTIVE", "0");
+    let mut tgi = Command::cargo_bin("oomwrap").unwrap();
+    tgi.env("OOMWRAP_EARLYOOM_ACTIVE", "0");
     tgi.args([
         "run",
         "--min-mem",
@@ -260,8 +260,8 @@ fn high_risk_profiles_require_earlyoom_unless_overridden() {
         .code(3)
         .stderr(predicate::str::contains("earlyoom is required"));
 
-    let mut allowed = Command::cargo_bin("infer-guard").unwrap();
-    allowed.env("INFER_GUARD_EARLYOOM_ACTIVE", "0");
+    let mut allowed = Command::cargo_bin("oomwrap").unwrap();
+    allowed.env("OOMWRAP_EARLYOOM_ACTIVE", "0");
     allowed.args([
         "run",
         "--profile",
@@ -281,7 +281,7 @@ fn high_risk_profiles_require_earlyoom_unless_overridden() {
 
 #[test]
 fn run_rejects_unsupported_systemd_scope_flag() {
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
     cmd.args([
         "run",
         "--profile",
@@ -297,7 +297,7 @@ fn run_rejects_unsupported_systemd_scope_flag() {
         .code(2)
         .stderr(predicate::str::contains("systemd scope support"));
 
-    let mut memory_high = Command::cargo_bin("infer-guard").unwrap();
+    let mut memory_high = Command::cargo_bin("oomwrap").unwrap();
     memory_high.args([
         "run",
         "--profile",
@@ -315,7 +315,7 @@ fn run_rejects_unsupported_systemd_scope_flag() {
         .code(2)
         .stderr(predicate::str::contains("systemd scope support"));
 
-    let mut memory_max = Command::cargo_bin("infer-guard").unwrap();
+    let mut memory_max = Command::cargo_bin("oomwrap").unwrap();
     memory_max.args([
         "run",
         "--profile",
@@ -340,8 +340,8 @@ fn run_allows_thresholds_equal_to_available_memory() {
     let meminfo_path = dir.path().join("meminfo");
     fs::write(&meminfo_path, meminfo(2048, 1024)).unwrap();
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
-    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -365,8 +365,8 @@ fn run_refuses_when_preflight_memory_is_below_floor() {
     let meminfo_path = dir.path().join("meminfo");
     fs::write(&meminfo_path, meminfo(1024, 0)).unwrap();
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
-    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -392,8 +392,8 @@ fn run_refuses_when_preflight_swap_is_below_floor() {
     let meminfo_path = dir.path().join("meminfo");
     fs::write(&meminfo_path, meminfo(10 * 1024, 0)).unwrap();
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
-    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -426,8 +426,8 @@ fn run_kills_process_group_when_memory_drops() {
         meminfo_path.display()
     );
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
-    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -469,8 +469,8 @@ fn run_escalates_to_sigkill_when_child_ignores_sigterm() {
         meminfo_path.display()
     );
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
-    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -515,8 +515,8 @@ fn run_sends_one_sigterm_during_grace_window() {
         meminfo_path.display()
     );
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
-    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -556,8 +556,8 @@ fn run_reaps_cooperative_term_without_waiting_full_grace() {
         meminfo_path.display()
     );
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
-    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -597,8 +597,8 @@ fn run_kills_remaining_group_members_after_leader_exits() {
         meminfo_path.display()
     );
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
-    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -639,7 +639,7 @@ fn run_cleans_background_group_after_leader_exits() {
         ready_path.display()
     );
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
     cmd.args([
         "run",
         "--profile",
@@ -678,8 +678,8 @@ fn run_cleans_process_group_when_monitoring_fails_after_spawn() {
         meminfo_path.display()
     );
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
-    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -722,8 +722,8 @@ fn run_cleans_process_group_when_guard_receives_term() {
         child_pid_path.display()
     );
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
-    cmd.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     cmd.args([
         "run",
         "--profile",
@@ -770,7 +770,7 @@ fn run_cleans_process_group_when_guard_receives_term() {
 
 #[test]
 fn run_rejects_invalid_durations_without_panic() {
-    let mut poll = Command::cargo_bin("infer-guard").unwrap();
+    let mut poll = Command::cargo_bin("oomwrap").unwrap();
     poll.args([
         "run",
         "--profile",
@@ -788,7 +788,7 @@ fn run_rejects_invalid_durations_without_panic() {
         .stderr(predicate::str::contains("invalid --poll"))
         .stderr(predicate::str::contains("panicked").not());
 
-    let mut term_grace = Command::cargo_bin("infer-guard").unwrap();
+    let mut term_grace = Command::cargo_bin("oomwrap").unwrap();
     term_grace.args([
         "run",
         "--profile",
@@ -810,7 +810,7 @@ fn run_rejects_invalid_durations_without_panic() {
 
 #[test]
 fn run_handles_huge_durations_without_panic() {
-    let mut poll = Command::cargo_bin("infer-guard").unwrap();
+    let mut poll = Command::cargo_bin("oomwrap").unwrap();
     poll.args([
         "run",
         "--profile",
@@ -840,8 +840,8 @@ fn run_handles_huge_durations_without_panic() {
         meminfo_path.display()
     );
 
-    let mut term_grace = Command::cargo_bin("infer-guard").unwrap();
-    term_grace.env("INFER_GUARD_MEMINFO_PATH", &meminfo_path);
+    let mut term_grace = Command::cargo_bin("oomwrap").unwrap();
+    term_grace.env("OOMWRAP_MEMINFO_PATH", &meminfo_path);
     term_grace.args([
         "run",
         "--profile",
@@ -881,7 +881,7 @@ fn path_shim_resolves_real_binary_without_recursing() {
     fs::write(&real, "#!/usr/bin/env bash\necho real-fake-vllm \"$@\"\n").unwrap();
     fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut install = Command::cargo_bin("infer-guard").unwrap();
+    let mut install = Command::cargo_bin("oomwrap").unwrap();
     install.args([
         "install-shims",
         "--bin-dir",
@@ -906,7 +906,7 @@ fn path_shim_resolves_real_binary_without_recursing() {
             real_dir.display()
         ),
     );
-    run.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    run.env("OOMWRAP_ALLOW_NO_EARLYOOM", "1");
     run.arg("smoke");
     run.assert()
         .success()
@@ -927,7 +927,7 @@ fn path_shim_can_run_wrapped_binary_later_in_path() {
     .unwrap();
     fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
     wrap.args([
         "wrap",
         real.to_str().unwrap(),
@@ -938,7 +938,7 @@ fn path_shim_can_run_wrapped_binary_later_in_path() {
     ]);
     wrap.assert().success();
 
-    let mut install = Command::cargo_bin("infer-guard").unwrap();
+    let mut install = Command::cargo_bin("oomwrap").unwrap();
     install.args([
         "install-shims",
         "--bin-dir",
@@ -963,7 +963,7 @@ fn path_shim_can_run_wrapped_binary_later_in_path() {
             real_dir.display()
         ),
     );
-    run.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    run.env("OOMWRAP_ALLOW_NO_EARLYOOM", "1");
     run.arg("smoke");
     run.assert()
         .success()
@@ -982,7 +982,7 @@ fn path_shim_treats_generated_defaults_as_data() {
     fs::write(&real, "#!/usr/bin/env bash\necho should-not-run\n").unwrap();
     fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut install = Command::cargo_bin("infer-guard").unwrap();
+    let mut install = Command::cargo_bin("oomwrap").unwrap();
     install
         .arg("install-shims")
         .arg("--bin-dir")
@@ -1003,7 +1003,7 @@ fn path_shim_treats_generated_defaults_as_data() {
             real_dir.display()
         ),
     );
-    run.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    run.env("OOMWRAP_ALLOW_NO_EARLYOOM", "1");
     run.assert()
         .code(2)
         .stderr(predicate::str::contains("invalid --min-mem"));
@@ -1018,7 +1018,7 @@ fn install_default_shims_and_refuse_unmanaged_collision() {
     let dir = tempdir().unwrap();
     let shim_dir = dir.path().join("shims");
 
-    let mut install = Command::cargo_bin("infer-guard").unwrap();
+    let mut install = Command::cargo_bin("oomwrap").unwrap();
     install.args([
         "install-shims",
         "--bin-dir",
@@ -1033,7 +1033,7 @@ fn install_default_shims_and_refuse_unmanaged_collision() {
     assert!(shim_dir.join("llama-server").exists());
 
     fs::write(shim_dir.join("custom-tool"), "not managed\n").unwrap();
-    let mut collision = Command::cargo_bin("infer-guard").unwrap();
+    let mut collision = Command::cargo_bin("oomwrap").unwrap();
     collision.args([
         "install-shims",
         "--bin-dir",
@@ -1046,7 +1046,7 @@ fn install_default_shims_and_refuse_unmanaged_collision() {
         .code(2)
         .stderr(predicate::str::contains("refusing to replace"));
 
-    let mut uninstall = Command::cargo_bin("infer-guard").unwrap();
+    let mut uninstall = Command::cargo_bin("oomwrap").unwrap();
     uninstall.args([
         "uninstall-shims",
         "--bin-dir",
@@ -1074,7 +1074,7 @@ fn install_force_replaces_symlink_without_touching_target() {
     let shim = shim_dir.join("fake-vllm");
     symlink(&real, &shim).unwrap();
 
-    let mut install = Command::cargo_bin("infer-guard").unwrap();
+    let mut install = Command::cargo_bin("oomwrap").unwrap();
     install.args([
         "install-shims",
         "--force",
@@ -1107,7 +1107,7 @@ fn install_force_replaces_symlink_without_touching_target() {
             real_dir.display()
         ),
     );
-    run.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    run.env("OOMWRAP_ALLOW_NO_EARLYOOM", "1");
     run.arg("smoke");
     run.assert()
         .success()
@@ -1123,7 +1123,7 @@ fn install_refuses_dangling_symlink_without_force() {
     let shim = shim_dir.join("fake-vllm");
     symlink(dir.path().join("missing"), &shim).unwrap();
 
-    let mut install = Command::cargo_bin("infer-guard").unwrap();
+    let mut install = Command::cargo_bin("oomwrap").unwrap();
     install.args([
         "install-shims",
         "--bin-dir",
@@ -1153,7 +1153,7 @@ fn install_and_uninstall_reject_path_like_tool_names() {
     let shim_dir = dir.path().join("shims");
     let escaped = dir.path().join("escape");
 
-    let mut relative = Command::cargo_bin("infer-guard").unwrap();
+    let mut relative = Command::cargo_bin("oomwrap").unwrap();
     relative.args([
         "install-shims",
         "--bin-dir",
@@ -1171,7 +1171,7 @@ fn install_and_uninstall_reject_path_like_tool_names() {
         .stderr(predicate::str::contains("bare executable name"));
     assert!(!escaped.exists());
 
-    let mut absolute = Command::cargo_bin("infer-guard").unwrap();
+    let mut absolute = Command::cargo_bin("oomwrap").unwrap();
     absolute.args([
         "install-shims",
         "--bin-dir",
@@ -1189,7 +1189,7 @@ fn install_and_uninstall_reject_path_like_tool_names() {
         .stderr(predicate::str::contains("bare executable name"));
     assert!(!escaped.exists());
 
-    let mut uninstall = Command::cargo_bin("infer-guard").unwrap();
+    let mut uninstall = Command::cargo_bin("oomwrap").unwrap();
     uninstall.args([
         "uninstall-shims",
         "--bin-dir",
@@ -1210,7 +1210,7 @@ fn uninstall_shims_does_not_delete_absolute_wrapper() {
     fs::write(&target, "#!/usr/bin/env bash\necho still-wrapped \"$@\"\n").unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
     wrap.args([
         "wrap",
         target.to_str().unwrap(),
@@ -1221,7 +1221,7 @@ fn uninstall_shims_does_not_delete_absolute_wrapper() {
     ]);
     wrap.assert().success();
 
-    let mut uninstall = Command::cargo_bin("infer-guard").unwrap();
+    let mut uninstall = Command::cargo_bin("oomwrap").unwrap();
     uninstall.args([
         "uninstall-shims",
         "--bin-dir",
@@ -1235,7 +1235,7 @@ fn uninstall_shims_does_not_delete_absolute_wrapper() {
     assert!(target.with_file_name("vllm.real").exists());
 
     let mut guarded = Command::new(&target);
-    guarded.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    guarded.env("OOMWRAP_ALLOW_NO_EARLYOOM", "1");
     guarded.arg("after-uninstall");
     guarded
         .assert()
@@ -1250,7 +1250,7 @@ fn wrap_and_unwrap_round_trip() {
     fs::write(&target, "#!/usr/bin/env bash\necho wrapped-real \"$@\"\n").unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
     wrap.args([
         "wrap",
         target.to_str().unwrap(),
@@ -1263,14 +1263,14 @@ fn wrap_and_unwrap_round_trip() {
     assert!(target.with_file_name("vllm.real").exists());
 
     let mut guarded = Command::new(&target);
-    guarded.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    guarded.env("OOMWRAP_ALLOW_NO_EARLYOOM", "1");
     guarded.arg("absolute");
     guarded
         .assert()
         .success()
         .stdout(predicate::str::contains("wrapped-real absolute"));
 
-    let mut unwrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut unwrap = Command::cargo_bin("oomwrap").unwrap();
     unwrap.args(["unwrap", target.to_str().unwrap()]);
     unwrap.assert().success();
     assert!(!target.with_file_name("vllm.real").exists());
@@ -1292,7 +1292,7 @@ fn unwrap_restores_original_symlink_even_if_target_is_missing() {
     fs::set_permissions(&actual, fs::Permissions::from_mode(0o755)).unwrap();
     symlink(&actual, &target).unwrap();
 
-    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
     wrap.args([
         "wrap",
         target.to_str().unwrap(),
@@ -1305,7 +1305,7 @@ fn unwrap_restores_original_symlink_even_if_target_is_missing() {
 
     fs::remove_file(&actual).unwrap();
 
-    let mut unwrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut unwrap = Command::cargo_bin("oomwrap").unwrap();
     unwrap.args(["unwrap", target.to_str().unwrap()]);
     unwrap.assert().success();
 
@@ -1325,7 +1325,7 @@ fn unwrap_symlink_to_wrapper_uses_wrapper_sidecar() {
     fs::write(&target, "#!/usr/bin/env bash\necho actual \"$@\"\n").unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
     wrap.args([
         "wrap",
         target.to_str().unwrap(),
@@ -1341,7 +1341,7 @@ fn unwrap_symlink_to_wrapper_uses_wrapper_sidecar() {
     symlink(&target, &symlink_path).unwrap();
     fs::write(&unrelated_sidecar, "unrelated\n").unwrap();
 
-    let mut unwrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut unwrap = Command::cargo_bin("oomwrap").unwrap();
     unwrap.args(["unwrap", symlink_path.to_str().unwrap()]);
     unwrap.assert().success();
 
@@ -1369,7 +1369,7 @@ fn absolute_wrapper_resolves_symlink_to_real_path() {
     fs::write(&target, "#!/usr/bin/env bash\necho symlink-real \"$@\"\n").unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
     wrap.args([
         "wrap",
         target.to_str().unwrap(),
@@ -1384,7 +1384,7 @@ fn absolute_wrapper_resolves_symlink_to_real_path() {
     symlink(&target, &symlink_path).unwrap();
 
     let mut guarded = Command::new(&symlink_path);
-    guarded.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    guarded.env("OOMWRAP_ALLOW_NO_EARLYOOM", "1");
     guarded.arg("via-symlink");
     guarded
         .assert()
@@ -1399,7 +1399,7 @@ fn wrapped_high_risk_tool_still_requires_earlyoom() {
     fs::write(&target, "#!/usr/bin/env bash\necho should-not-run\n").unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
     wrap.args([
         "wrap",
         target.to_str().unwrap(),
@@ -1411,7 +1411,7 @@ fn wrapped_high_risk_tool_still_requires_earlyoom() {
     wrap.assert().success();
 
     let mut guarded = Command::new(&target);
-    guarded.env("INFER_GUARD_EARLYOOM_ACTIVE", "0");
+    guarded.env("OOMWRAP_EARLYOOM_ACTIVE", "0");
     guarded
         .assert()
         .code(3)
@@ -1427,7 +1427,7 @@ fn absolute_wrapper_treats_generated_defaults_as_data() {
     fs::write(&target, "#!/usr/bin/env bash\necho should-not-run\n").unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut wrap = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
     wrap.arg("wrap")
         .arg(&target)
         .args(["--min-mem"])
@@ -1436,7 +1436,7 @@ fn absolute_wrapper_treats_generated_defaults_as_data() {
     wrap.assert().success();
 
     let mut guarded = Command::new(&target);
-    guarded.env("INFER_GUARD_ALLOW_NO_EARLYOOM", "1");
+    guarded.env("OOMWRAP_ALLOW_NO_EARLYOOM", "1");
     guarded
         .assert()
         .code(2)
@@ -1451,7 +1451,7 @@ fn absolute_wrapper_treats_generated_defaults_as_data() {
 fn wrap_and_unwrap_validate_bad_inputs() {
     let dir = tempdir().unwrap();
     let missing = dir.path().join("missing");
-    let mut wrap_missing = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap_missing = Command::cargo_bin("oomwrap").unwrap();
     wrap_missing.args(["wrap", missing.to_str().unwrap()]);
     wrap_missing
         .assert()
@@ -1460,7 +1460,7 @@ fn wrap_and_unwrap_validate_bad_inputs() {
 
     let directory = dir.path().join("directory");
     fs::create_dir(&directory).unwrap();
-    let mut wrap_directory = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap_directory = Command::cargo_bin("oomwrap").unwrap();
     wrap_directory.args(["wrap", directory.to_str().unwrap()]);
     wrap_directory
         .assert()
@@ -1469,21 +1469,19 @@ fn wrap_and_unwrap_validate_bad_inputs() {
 
     let target = dir.path().join("not-executable");
     fs::write(&target, "plain text\n").unwrap();
-    let mut wrap_non_executable = Command::cargo_bin("infer-guard").unwrap();
+    let mut wrap_non_executable = Command::cargo_bin("oomwrap").unwrap();
     wrap_non_executable.args(["wrap", target.to_str().unwrap()]);
     wrap_non_executable
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot wrap non-executable path"));
 
-    let mut unwrap_plain = Command::cargo_bin("infer-guard").unwrap();
+    let mut unwrap_plain = Command::cargo_bin("oomwrap").unwrap();
     unwrap_plain.args(["unwrap", target.to_str().unwrap()]);
     unwrap_plain
         .assert()
         .code(2)
-        .stderr(predicate::str::contains(
-            "not an infer-guard managed wrapper",
-        ));
+        .stderr(predicate::str::contains("not an oomwrap managed wrapper"));
 }
 
 #[test]
@@ -1494,7 +1492,7 @@ fn wrap_refuses_existing_real_path_without_force() {
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(dir.path().join("vllm.real"), "already exists\n").unwrap();
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
     cmd.args(["wrap", target.to_str().unwrap()]);
     cmd.assert()
         .code(2)
@@ -1509,7 +1507,7 @@ fn wrap_refuses_dangling_real_sidecar_without_force() {
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
     symlink(dir.path().join("missing"), dir.path().join("vllm.real")).unwrap();
 
-    let mut cmd = Command::cargo_bin("infer-guard").unwrap();
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
     cmd.args(["wrap", target.to_str().unwrap()]);
     cmd.assert()
         .code(2)

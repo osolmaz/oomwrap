@@ -1,3 +1,3 @@
 fn main() {
-    std::process::exit(infer_guard::main_entry());
+    std::process::exit(oomwrap::main_entry());
 }

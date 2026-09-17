@@ -1,11 +1,11 @@
 [package]
-name = "infer-guard"
+name = "oomwrap"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-description = "Guard local LLM inference launches from OOM failures"
-repository = "https://github.com/osolmaz/infer-guard"
+description = "Run one command with process-scoped RAM and swap protection"
+repository = "https://github.com/osolmaz/oomwrap"
 
 [dependencies]
 anyhow = "1.0.100"

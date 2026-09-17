@@ -1,0 +1,7 @@
+interface:
+  display_name: "Memory-Safe Launch"
+  short_description: "Guard local memory-heavy commands"
+  default_prompt: "Use $memory-safe-launch before starting a local command that can consume large RAM or swap."
+
+policy:
+  allow_implicit_invocation: true

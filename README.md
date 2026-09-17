@@ -1,98 +1,127 @@
-# infer-guard
+# oomwrap
 
-infer-guard is a command-line guard for local LLM inference processes.
-It starts tools such as vLLM, llama.cpp, SGLang, TensorRT-LLM, and TGI with
-memory checks, process-group cleanup, and earlyoom-aware launch protection so a
-bad model load or benchmark run is less likely to take down an interactive
-machine.
+oomwrap runs one command under process-scoped memory protection. It checks
+available RAM and swap before launch, starts the command in its own process
+group, and stops that group if either configured floor is crossed.
+
+Use it for any local workload that can exhaust memory, such as a large build,
+renderer, data conversion, model load, or inference server. oomwrap complements
+machine-wide tools such as `earlyoom`; it does not replace them.
 
 ## Install
 
-infer-guard is not published yet. Install it from a local checkout:
+oomwrap is not published as a package yet. Install it from GitHub:
 
 ```bash
-cargo install --path .
+cargo install --git https://github.com/osolmaz/oomwrap --locked
 ```
 
-Run a quick machine check:
+For development from a local checkout:
 
 ```bash
-infer-guard doctor
+cargo install --path . --locked
 ```
 
-For high-risk inference profiles, infer-guard requires `earlyoom` by default.
-Use `--allow-no-earlyoom` only for tests or controlled machines where you have a
-separate safety net.
-
-## Run A Command
-
-Run a server through the guard:
+Check the machine and installation:
 
 ```bash
-infer-guard run --profile vllm --min-mem 24G --min-swap 4G -- vllm serve ...
+oomwrap doctor
+oomwrap inspect
 ```
 
-`infer-guard run` launches the child in its own process group, watches available
-memory and swap, and terminates the group when the configured floor is crossed.
-It passes through the child exit code on normal exits and returns `137` when it
-kills a workload for memory pressure.
+## Run a command
 
-Supported profile names are `auto`, `vllm`, `llama-cpp`, `sglang`, `trtllm`,
-`tgi`, and `generic`.
-
-## Install PATH Shims
-
-PATH shims let existing commands run through infer-guard without changing every
-script:
+Choose RAM and swap floors for the machine and workload:
 
 ```bash
-infer-guard install-shims
+oomwrap run \
+  --profile generic \
+  --min-mem 8G \
+  --min-swap 1G \
+  -- ./build-large-project.sh
 ```
 
-By default this installs guarded shims for common inference tools under
-`~/.local/bin`. Make sure `~/.local/bin` appears before the real runtime binary
-directory in `PATH`.
+oomwrap launches the child in its own process group. It forwards terminal
+signals and returns the child exit code on a normal exit. If memory pressure
+crosses a floor, oomwrap sends `SIGTERM`, waits for the configured grace period,
+and then sends `SIGKILL` to the remaining process group. A pressure stop returns
+exit code `137`.
 
-To remove the shims:
+## Inference example
+
+Inference profiles recognize common local engines and require active `earlyoom`
+by default:
 
 ```bash
-infer-guard uninstall-shims
+oomwrap run \
+  --profile sglang \
+  --min-mem 24G \
+  --min-swap 4G \
+  -- python -m sglang.launch_server ...
 ```
 
-## Wrap A Runtime Binary
+Supported profiles are `auto`, `vllm`, `llama-cpp`, `sglang`, `trtllm`, `tgi`,
+and `generic`. Use `generic` for other commands. Use `--allow-no-earlyoom` only
+for tests or controlled machines with another machine-wide safety mechanism.
 
-Use `wrap` when a benchmark or script calls a fixed runtime path directly:
+## Event logs
+
+Write launch, refusal, exit, and memory-pressure events as JSON Lines:
 
 ```bash
-infer-guard wrap ~/runtimes/vllm/current/.venv/bin/vllm
+oomwrap run \
+  --event-log ./oomwrap.events.jsonl \
+  --profile generic \
+  --min-mem 8G \
+  --min-swap 1G \
+  -- ./memory-heavy-command
 ```
 
-This moves the original executable to `vllm.real` and replaces `vllm` with a
-guarded wrapper. Restore the original binary with:
+## Inference command wrappers
+
+PATH shims let existing inference commands run through oomwrap without changes
+to each script:
 
 ```bash
-infer-guard unwrap ~/runtimes/vllm/current/.venv/bin/vllm
+oomwrap install-shims
 ```
 
-## Event Logs
+This installs shims for common inference tools under `~/.local/bin`. Put that
+directory before the real runtime directory in `PATH`.
 
-Write launch, refusal, exit, and memory-pressure events as JSON lines:
+Remove the shims with:
 
 ```bash
-infer-guard run --event-log ./infer-guard.events.jsonl -- vllm serve ...
+oomwrap uninstall-shims
 ```
 
-Event logs are useful when a long benchmark run is killed and you need to know
-whether infer-guard refused the launch, saw memory pressure, or observed a
-normal child exit.
+Use `wrap` when a benchmark or script calls a fixed runtime path:
 
-## Exit Behavior
+```bash
+oomwrap wrap ~/runtimes/vllm/current/.venv/bin/vllm
+```
 
-- Child exits normally: returns the child exit code.
-- Missing required earlyoom: returns `3`.
-- Preflight memory or swap floor failure: returns `4`.
-- Memory-pressure kill after launch: returns `137`.
-- Guard configuration or runtime error: returns `2`.
+This moves the original executable to `vllm.real` and places an oomwrap-managed
+wrapper at the original path. Restore it with:
+
+```bash
+oomwrap unwrap ~/runtimes/vllm/current/.venv/bin/vllm
+```
+
+## Exit behavior
+
+- Child exits normally: return the child exit code.
+- Required `earlyoom` is missing: return `3`.
+- A preflight memory or swap floor fails: return `4`.
+- oomwrap stops the group for memory pressure: return `137`.
+- Configuration or supervision fails: return `2`.
+
+## Agent skill
+
+The canonical `memory-safe-launch` skill is in
+[`skills/memory-safe-launch`](skills/memory-safe-launch). It describes a safe
+launch procedure for general memory-heavy commands and adds checks for local
+model inference.
 
 ## License
 

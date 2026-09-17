@@ -31,8 +31,8 @@ const DEFAULT_TOOLS: &[&str] = &[
     "trtllm-serve",
     "text-generation-launcher",
 ];
-const PATH_SHIM_MARKER: &str = "infer-guard managed path shim";
-const ABSOLUTE_WRAPPER_MARKER: &str = "infer-guard managed absolute wrapper";
+const PATH_SHIM_MARKER: &str = "oomwrap managed path shim";
+const ABSOLUTE_WRAPPER_MARKER: &str = "oomwrap managed absolute wrapper";
 const DEFAULT_MIN_MEM: &str = "24G";
 const DEFAULT_MIN_SWAP: &str = "4G";
 const DEFAULT_POLL: &str = "1s";
@@ -204,7 +204,7 @@ fn doctor(args: DoctorArgs) -> Result<i32> {
         return Ok(0);
     }
 
-    println!("infer-guard doctor");
+    println!("oomwrap doctor");
     println!("  os: {}", report.os);
     println!("  arch: {}", report.arch);
     println!(
@@ -227,10 +227,10 @@ fn doctor(args: DoctorArgs) -> Result<i32> {
         );
     }
     println!(
-        "  inference processes: {}",
-        report.inference_processes.len()
+        "  known high-memory processes: {}",
+        report.known_high_memory_processes.len()
     );
-    for process in report.inference_processes.iter().take(10) {
+    for process in report.known_high_memory_processes.iter().take(10) {
         println!(
             "    pid={} rss={} cmd={}",
             process.pid,
@@ -254,7 +254,7 @@ fn inspect(args: InspectArgs) -> Result<i32> {
             .iter()
             .map(|tool| (*tool).to_string())
             .collect(),
-        infer_guard_bin: current_infer_guard_bin()?.display().to_string(),
+        oomwrap_bin: current_oomwrap_bin()?.display().to_string(),
         home_bin_dir: default_bin_dir()?.display().to_string(),
         doctor: DoctorReport::collect()?,
     };
@@ -262,8 +262,8 @@ fn inspect(args: InspectArgs) -> Result<i32> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&info)?);
     } else {
-        println!("infer-guard inspect");
-        println!("  binary: {}", info.infer_guard_bin);
+        println!("oomwrap inspect");
+        println!("  binary: {}", info.oomwrap_bin);
         println!("  default bin dir: {}", info.home_bin_dir);
         println!("  default tools: {}", info.default_tools.join(", "));
         println!(
@@ -558,7 +558,7 @@ fn install_shims(args: InstallShimsArgs) -> Result<i32> {
     fs::create_dir_all(&bin_dir)
         .with_context(|| format!("failed to create {}", bin_dir.display()))?;
     let tools = selected_tools(&args.tools);
-    let infer_guard_bin = current_infer_guard_bin()?;
+    let oomwrap_bin = current_oomwrap_bin()?;
 
     for tool in tools {
         validate_tool_name(&tool)?;
@@ -568,7 +568,7 @@ fn install_shims(args: InstallShimsArgs) -> Result<i32> {
         }
         write_executable(
             &path,
-            &path_shim_script(&tool, &infer_guard_bin, &args.min_mem, &args.min_swap),
+            &path_shim_script(&tool, &oomwrap_bin, &args.min_mem, &args.min_swap),
         )?;
         println!("installed shim: {}", path.display());
     }
@@ -618,10 +618,10 @@ fn wrap(args: WrapArgs) -> Result<i32> {
 
     fs::rename(&target, &real)
         .with_context(|| format!("failed to move {} to {}", target.display(), real.display()))?;
-    let infer_guard_bin = current_infer_guard_bin()?;
+    let oomwrap_bin = current_oomwrap_bin()?;
     if let Err(error) = write_executable(
         &target,
-        &absolute_wrapper_script(&infer_guard_bin, &args.min_mem, &args.min_swap),
+        &absolute_wrapper_script(&oomwrap_bin, &args.min_mem, &args.min_swap),
     ) {
         let _ = fs::rename(&real, &target);
         return Err(error);
@@ -635,7 +635,7 @@ fn unwrap(args: UnwrapArgs) -> Result<i32> {
         .with_context(|| format!("failed to resolve {}", args.path.display()))?;
     let real = real_path_for(&target);
     if !is_managed_absolute_wrapper(&target)? {
-        bail!("not an infer-guard managed wrapper: {}", target.display());
+        bail!("not an oomwrap managed wrapper: {}", target.display());
     }
     if !path_entry_exists(&real)? {
         bail!("missing real executable: {}", real.display());
@@ -971,7 +971,7 @@ fn parse_meminfo(content: &str) -> Result<MemInfo> {
 }
 
 fn meminfo_path() -> PathBuf {
-    env::var_os("INFER_GUARD_MEMINFO_PATH")
+    env::var_os("OOMWRAP_MEMINFO_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/proc/meminfo"))
 }
@@ -1109,7 +1109,7 @@ fn command_strings(command: &[OsString]) -> Vec<String> {
 }
 
 fn earlyoom_active() -> Result<bool> {
-    if let Some(value) = env::var_os("INFER_GUARD_EARLYOOM_ACTIVE") {
+    if let Some(value) = env::var_os("OOMWRAP_EARLYOOM_ACTIVE") {
         let value = value.to_string_lossy();
         return Ok(matches!(value.as_ref(), "1" | "true" | "yes" | "on"));
     }
@@ -1188,7 +1188,7 @@ struct DoctorReport {
     mem: MemInfo,
     earlyoom_active: bool,
     home_disk_available_bytes: Option<u64>,
-    inference_processes: Vec<ProcessInfo>,
+    known_high_memory_processes: Vec<ProcessInfo>,
     warnings: Vec<String>,
 }
 
@@ -1198,7 +1198,7 @@ impl DoctorReport {
     fn collect() -> Result<Self> {
         let mem = read_meminfo(Path::new("/proc/meminfo"))?;
         let earlyoom = earlyoom_active()?;
-        let inference_processes = inference_processes()?;
+        let known_high_memory_processes = known_high_memory_processes()?;
         let mut warnings = Vec::new();
         if !earlyoom {
             warnings.push(
@@ -1206,8 +1206,8 @@ impl DoctorReport {
                     .to_string(),
             );
         }
-        if !inference_processes.is_empty() {
-            warnings.push("local inference-like processes are already running".to_string());
+        if !known_high_memory_processes.is_empty() {
+            warnings.push("known high-memory processes are already running".to_string());
         }
 
         Ok(Self {
@@ -1216,7 +1216,7 @@ impl DoctorReport {
             mem,
             earlyoom_active: earlyoom,
             home_disk_available_bytes: home_dir().and_then(|path| disk_available(&path).ok()),
-            inference_processes,
+            known_high_memory_processes,
             warnings,
         })
     }
@@ -1229,7 +1229,7 @@ struct InspectReport {
     default_poll: String,
     default_term_grace: String,
     default_tools: Vec<String>,
-    infer_guard_bin: String,
+    oomwrap_bin: String,
     home_bin_dir: String,
     doctor: DoctorReport,
 }
@@ -1244,7 +1244,7 @@ struct ProcessInfo {
 // Live process discovery is inherently host-dependent; command matching helpers
 // are covered separately.
 #[cfg_attr(test, mutants::skip)]
-fn inference_processes() -> Result<Vec<ProcessInfo>> {
+fn known_high_memory_processes() -> Result<Vec<ProcessInfo>> {
     let patterns = [
         "vllm",
         "llama-server",
@@ -1310,8 +1310,8 @@ fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
 
-fn current_infer_guard_bin() -> Result<PathBuf> {
-    env::current_exe().context("failed to resolve current infer-guard binary")
+fn current_oomwrap_bin() -> Result<PathBuf> {
+    env::current_exe().context("failed to resolve current oomwrap binary")
 }
 
 fn is_executable(path: &Path) -> Result<bool> {
@@ -1354,7 +1354,7 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
 
     for attempt in 0..100 {
         let tmp = parent.join(format!(
-            ".{file_name}.infer-guard-tmp-{}-{attempt}",
+            ".{file_name}.oomwrap-tmp-{}-{attempt}",
             std::process::id()
         ));
         let mut file = match OpenOptions::new().write(true).create_new(true).open(&tmp) {
@@ -1402,8 +1402,8 @@ fn real_path_for(path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-fn path_shim_script(tool: &str, infer_guard_bin: &Path, min_mem: &str, min_swap: &str) -> String {
-    let env_name = format!("INFER_GUARD_REAL_{}", env_suffix(tool));
+fn path_shim_script(tool: &str, oomwrap_bin: &Path, min_mem: &str, min_swap: &str) -> String {
+    let env_name = format!("OOMWRAP_REAL_{}", env_suffix(tool));
     format!(
         r#"#!/usr/bin/env bash
 # {PATH_SHIM_MARKER}
@@ -1411,13 +1411,13 @@ set -euo pipefail
 
 tool={tool_q}
 real_env={env_q}
-default_infer_guard={bin_q}
+default_oomwrap={bin_q}
 default_min_mem={min_mem_q}
 default_min_swap={min_swap_q}
-infer_guard="${{INFER_GUARD_BIN:-$default_infer_guard}}"
-min_mem="${{INFER_GUARD_MIN_MEM:-$default_min_mem}}"
-min_swap="${{INFER_GUARD_MIN_SWAP:-$default_min_swap}}"
-profile="${{INFER_GUARD_PROFILE:-auto}}"
+oomwrap="${{OOMWRAP_BIN:-$default_oomwrap}}"
+min_mem="${{OOMWRAP_MIN_MEM:-$default_min_mem}}"
+min_swap="${{OOMWRAP_MIN_SWAP:-$default_min_swap}}"
+profile="${{OOMWRAP_PROFILE:-auto}}"
 real="${{!real_env:-}}"
 
 if [[ -z "$real" ]]; then
@@ -1437,55 +1437,55 @@ if [[ -z "$real" ]]; then
 fi
 
 if [[ -z "$real" ]]; then
-  echo "infer-guard: could not resolve real executable for $tool" >&2
+  echo "oomwrap: could not resolve real executable for $tool" >&2
   echo "set $real_env=/path/to/$tool or put the real binary later in PATH" >&2
   exit 127
 fi
 
 args=(run --profile "$profile" --min-mem "$min_mem" --min-swap "$min_swap")
-if [[ "${{INFER_GUARD_ALLOW_NO_EARLYOOM:-}}" == "1" ]]; then
+if [[ "${{OOMWRAP_ALLOW_NO_EARLYOOM:-}}" == "1" ]]; then
   args+=(--allow-no-earlyoom)
 fi
-if [[ -n "${{INFER_GUARD_EVENT_LOG:-}}" ]]; then
-  args+=(--event-log "$INFER_GUARD_EVENT_LOG")
+if [[ -n "${{OOMWRAP_EVENT_LOG:-}}" ]]; then
+  args+=(--event-log "$OOMWRAP_EVENT_LOG")
 fi
 
-exec "$infer_guard" "${{args[@]}}" -- "$real" "$@"
+exec "$oomwrap" "${{args[@]}}" -- "$real" "$@"
 "#,
         tool_q = sh_quote(tool),
         env_q = sh_quote(&env_name),
-        bin_q = sh_quote(&infer_guard_bin.display().to_string()),
+        bin_q = sh_quote(&oomwrap_bin.display().to_string()),
         min_mem_q = sh_quote(min_mem),
         min_swap_q = sh_quote(min_swap),
     )
 }
 
-fn absolute_wrapper_script(infer_guard_bin: &Path, min_mem: &str, min_swap: &str) -> String {
+fn absolute_wrapper_script(oomwrap_bin: &Path, min_mem: &str, min_swap: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 # {ABSOLUTE_WRAPPER_MARKER}
 set -euo pipefail
 
-default_infer_guard={bin_q}
+default_oomwrap={bin_q}
 default_min_mem={min_mem_q}
 default_min_swap={min_swap_q}
-infer_guard="${{INFER_GUARD_BIN:-$default_infer_guard}}"
-min_mem="${{INFER_GUARD_MIN_MEM:-$default_min_mem}}"
-min_swap="${{INFER_GUARD_MIN_SWAP:-$default_min_swap}}"
-profile="${{INFER_GUARD_PROFILE:-auto}}"
+oomwrap="${{OOMWRAP_BIN:-$default_oomwrap}}"
+min_mem="${{OOMWRAP_MIN_MEM:-$default_min_mem}}"
+min_swap="${{OOMWRAP_MIN_SWAP:-$default_min_swap}}"
+profile="${{OOMWRAP_PROFILE:-auto}}"
 real="$(readlink -f "${{BASH_SOURCE[0]}}").real"
 
 args=(run --profile "$profile" --min-mem "$min_mem" --min-swap "$min_swap")
-if [[ "${{INFER_GUARD_ALLOW_NO_EARLYOOM:-}}" == "1" ]]; then
+if [[ "${{OOMWRAP_ALLOW_NO_EARLYOOM:-}}" == "1" ]]; then
   args+=(--allow-no-earlyoom)
 fi
-if [[ -n "${{INFER_GUARD_EVENT_LOG:-}}" ]]; then
-  args+=(--event-log "$INFER_GUARD_EVENT_LOG")
+if [[ -n "${{OOMWRAP_EVENT_LOG:-}}" ]]; then
+  args+=(--event-log "$OOMWRAP_EVENT_LOG")
 fi
 
-exec "$infer_guard" "${{args[@]}}" -- "$real" "$@"
+exec "$oomwrap" "${{args[@]}}" -- "$real" "$@"
 "#,
-        bin_q = sh_quote(&infer_guard_bin.display().to_string()),
+        bin_q = sh_quote(&oomwrap_bin.display().to_string()),
         min_mem_q = sh_quote(min_mem),
         min_swap_q = sh_quote(min_swap),
     )
@@ -1755,7 +1755,7 @@ SwapFree:          789 kB
         ));
         assert!(command_invokes_executable("earlyoom -m 5", "earlyoom"));
         assert!(!command_invokes_executable(
-            "infer-guard run --require-earlyoom",
+            "oomwrap run --require-earlyoom",
             "earlyoom"
         ));
         assert!(!command_invokes_executable(
@@ -1819,20 +1819,20 @@ SwapFree:          789 kB
 
     #[test]
     fn generated_path_shim_has_marker_and_env_escape() {
-        let script = path_shim_script("vllm", Path::new("/tmp/infer-guard"), "24G", "4G");
+        let script = path_shim_script("vllm", Path::new("/tmp/oomwrap"), "24G", "4G");
         assert!(script.contains(PATH_SHIM_MARKER));
-        assert!(script.contains("infer-guard managed"));
-        assert!(script.contains("INFER_GUARD_REAL_VLLM"));
-        assert!(script.contains("INFER_GUARD_ALLOW_NO_EARLYOOM"));
+        assert!(script.contains("oomwrap managed"));
+        assert!(script.contains("OOMWRAP_REAL_VLLM"));
+        assert!(script.contains("OOMWRAP_ALLOW_NO_EARLYOOM"));
     }
 
     #[test]
     fn generated_absolute_wrapper_has_marker_and_resolves_real_target() {
-        let script = absolute_wrapper_script(Path::new("/tmp/infer-guard"), "24G", "4G");
+        let script = absolute_wrapper_script(Path::new("/tmp/oomwrap"), "24G", "4G");
         assert!(script.contains(ABSOLUTE_WRAPPER_MARKER));
         assert!(script.contains("readlink -f"));
         assert!(script.contains(".real"));
-        assert!(script.contains("INFER_GUARD_ALLOW_NO_EARLYOOM"));
+        assert!(script.contains("OOMWRAP_ALLOW_NO_EARLYOOM"));
     }
 
     #[test]
