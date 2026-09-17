@@ -53,16 +53,44 @@ exit code `137`.
 
 ## Use with earlyoom
 
-`oomwrap` and [`earlyoom`](https://github.com/rfjakob/earlyoom) protect different
-parts of the machine:
+[`earlyoom`](https://github.com/rfjakob/earlyoom) is a Linux user-space daemon
+that acts before the kernel's out-of-memory killer. It checks available memory
+and free swap several times per second. By default, when both fall below its
+configured thresholds, it selects the process with the highest kernel
+`oom_score` and sends `SIGTERM`. It sends `SIGKILL` at a lower emergency
+threshold and continues until memory pressure recovers.
 
-- `oomwrap` watches the process group that it starts. It uses explicit available
-  RAM and free swap floors, and it stops only that process group.
-- `earlyoom` watches the whole machine. It remains a last line of defense when
-  any process causes system-wide memory pressure.
+This is machine-wide protection. `earlyoom` can stop any process selected by its
+policy, including a process outside the current workload. Its thresholds and
+process preference rules are configurable.
 
-Use both on a workstation. `oomwrap doctor` reports whether `earlyoom` is
-active. oomwrap does not install or configure `earlyoom`.
+`oomwrap` protects a narrower scope. It watches only the process group that it
+starts, uses explicit available RAM and free swap floors, and stops that whole
+group when a floor is crossed. This makes cleanup predictable for an inference
+server and its child processes.
+
+Use both on a workstation. Set the oomwrap floors above the emergency levels
+used by `earlyoom` so oomwrap can stop the guarded workload first. `earlyoom`
+then remains the machine-wide fallback for other processes and unexpected
+memory pressure.
+
+Check both tools with:
+
+```bash
+systemctl is-active earlyoom
+systemctl status earlyoom
+oomwrap doctor
+```
+
+When `earlyoom` runs as a system service, inspect its actions with:
+
+```bash
+sudo journalctl -u earlyoom | grep sending
+```
+
+oomwrap does not install or configure `earlyoom`. Neither tool replaces the
+need to leave enough memory headroom for the operating system and temporary
+allocation peaks.
 
 ## Run inference engines
 
