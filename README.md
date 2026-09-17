@@ -1,8 +1,10 @@
 # oomwrap
 
 <p align="center">
-  <img src="assets/cover.svg" alt="oomwrap wraps an agent-launched inference server, watches RAM and swap floors, and stops its process group before the machine freezes" width="880">
+  <img src="assets/cover.svg" alt="Wrap commands that might cause out-of-memory errors, and stop them before they freeze your machine" width="880">
 </p>
+
+<p align="center"><strong>Wrap commands that might cause out-of-memory errors, and stop them before they freeze your machine</strong></p>
 
 oomwrap is a Linux command-line guard for agents that launch local inference
 engines and other memory-heavy jobs. It wraps one command, watches available RAM
