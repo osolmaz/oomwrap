@@ -9,7 +9,7 @@ Use this procedure before a local command can consume enough RAM or swap to
 freeze the machine.
 
 Canonical source:
-<https://github.com/osolmaz/oomwrap/tree/main/skills/memory-safe-launch>
+<https://github.com/osolmaz/oomwrap/tree/main/.agents/skills/memory-safe-launch>
 
 ## 1. Confirm the target
 

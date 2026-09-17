@@ -22,6 +22,8 @@ use nix::unistd::{Pid, getpgrp, tcgetpgrp, tcsetpgrp};
 use serde::{Deserialize, Serialize};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
+mod skills;
+
 const DEFAULT_TOOLS: &[&str] = &[
     "vllm",
     "llama-server",
@@ -176,6 +178,10 @@ impl Profile {
 }
 
 pub fn main_entry() -> i32 {
+    if let Some(code) = skills::handle_if_requested() {
+        return code;
+    }
+
     match run_cli() {
         Ok(code) => code,
         Err(error) => {

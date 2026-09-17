@@ -1,5 +1,9 @@
 # oomwrap
 
+<p align="center">
+  <img src="assets/cover.svg" alt="oomwrap: one command enters a process-scoped wrapper that watches RAM and swap floors and stops the owned process group with SIGTERM then SIGKILL before the host freezes" width="880">
+</p>
+
 oomwrap runs one command under process-scoped memory protection. It checks
 available RAM and swap before launch, starts the command in its own process
 group, and stops that group if either configured floor is crossed.
@@ -10,10 +14,17 @@ machine-wide tools such as `earlyoom`; it does not replace them.
 
 ## Install
 
-oomwrap is not published as a package yet. Install it from GitHub:
+oomwrap is being prepared for its first crates.io release. Until that release,
+install it from GitHub:
 
 ```bash
 cargo install --git https://github.com/osolmaz/oomwrap --locked
+```
+
+After the first crates.io release, install it with:
+
+```bash
+cargo install oomwrap --locked
 ```
 
 For development from a local checkout:
@@ -119,9 +130,21 @@ oomwrap unwrap ~/runtimes/vllm/current/.venv/bin/vllm
 ## Agent skill
 
 The canonical `memory-safe-launch` skill is in
-[`skills/memory-safe-launch`](skills/memory-safe-launch). It describes a safe
-launch procedure for general memory-heavy commands and adds checks for local
-model inference.
+[`.agents/skills/memory-safe-launch`](.agents/skills/memory-safe-launch). It
+describes a safe launch procedure for general memory-heavy commands and adds
+checks for local model inference.
+
+The binary exposes the skill through
+[Skillflag](https://github.com/osolmaz/skillflag):
+
+```bash
+oomwrap --skill list
+oomwrap --skill show memory-safe-launch
+oomwrap --skill export memory-safe-launch > memory-safe-launch.tar
+```
+
+The skill is embedded in the binary, so these commands also work after a
+`cargo install` without the source checkout.
 
 ## License
 

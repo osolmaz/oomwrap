@@ -43,6 +43,77 @@ fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn tar_paths(bytes: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut offset = 0;
+
+    while offset + 512 <= bytes.len() {
+        let header = &bytes[offset..offset + 512];
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+
+        let name_end = header[..100]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(100);
+        paths.push(String::from_utf8(header[..name_end].to_vec()).unwrap());
+
+        let size_text = String::from_utf8_lossy(&header[124..136]);
+        let size_text = size_text.trim_matches(['\0', ' ']);
+        let size = if size_text.is_empty() {
+            0
+        } else {
+            usize::from_str_radix(size_text, 8).unwrap()
+        };
+        offset += 512 + size.div_ceil(512) * 512;
+    }
+
+    paths
+}
+
+#[test]
+fn skillflag_lists_embedded_skill() {
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.args(["--skill", "list", "--json"]);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("\"id\":\"memory-safe-launch\""));
+}
+
+#[test]
+fn skillflag_shows_canonical_skill() {
+    let output = Command::cargo_bin("oomwrap")
+        .unwrap()
+        .args(["--skill", "show", "memory-safe-launch"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let expected = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".agents/skills/memory-safe-launch/SKILL.md"),
+    )
+    .unwrap();
+    assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn skillflag_exports_complete_skill() {
+    let output = Command::cargo_bin("oomwrap")
+        .unwrap()
+        .args(["--skill", "export", "memory-safe-launch"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let paths = tar_paths(&output.stdout);
+    assert!(paths.contains(&"memory-safe-launch/SKILL.md".to_owned()));
+    assert!(paths.contains(&"memory-safe-launch/agents/openai.yaml".to_owned()));
+    assert!(paths.contains(
+        &"memory-safe-launch/references/unified-memory-inference-recovery.md".to_owned()
+    ));
+}
+
 #[test]
 fn doctor_prints_status() {
     let mut cmd = Command::cargo_bin("oomwrap").unwrap();
