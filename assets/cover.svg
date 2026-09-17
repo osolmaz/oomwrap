@@ -23,7 +23,6 @@
 
   <!-- Left: name, tagline, command line (content spans y 76-244, centered on 160) -->
   <g>
-    <text x="56" y="66" class="mono" font-size="11" font-weight="700" fill="#3fb950" letter-spacing="0.8">FOR AGENTS RUNNING LOCAL INFERENCE</text>
     <text x="56" y="110" class="mono" font-size="46" font-weight="700">
       <tspan fill="#58a6ff">oom</tspan><tspan fill="#e6edf3">wrap</tspan>
     </text>
