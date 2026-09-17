@@ -4,9 +4,9 @@
   <img src="assets/cover.svg" alt="oomwrap: one command enters a process-scoped wrapper that watches RAM and swap floors and stops the owned process group with SIGTERM then SIGKILL before the host freezes" width="880">
 </p>
 
-oomwrap runs one command under process-scoped memory protection. It checks
-available RAM and swap before launch, starts the command in its own process
-group, and stops that group if either configured floor is crossed.
+oomwrap is a Linux command-line tool for process-scoped memory protection. It
+checks available RAM and swap before it starts one command, then stops that
+command's process group if either configured floor is crossed.
 
 Use it for any local workload that can exhaust memory, such as a large build,
 renderer, data conversion, model load, or inference server. oomwrap complements
@@ -14,17 +14,10 @@ machine-wide tools such as `earlyoom`; it does not replace them.
 
 ## Install
 
-oomwrap is being prepared for its first crates.io release. Until that release,
-install it from GitHub:
+Install oomwrap from GitHub:
 
 ```bash
 cargo install --git https://github.com/osolmaz/oomwrap --locked
-```
-
-After the first crates.io release, install it with:
-
-```bash
-cargo install oomwrap --locked
 ```
 
 For development from a local checkout:
