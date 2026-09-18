@@ -31,7 +31,7 @@
 
     <rect x="56" y="200" width="392" height="44" rx="8" fill="#161b22" stroke="#30363d"/>
     <text x="74" y="228" class="mono" font-size="14">
-      <tspan fill="#3fb950">$</tspan><tspan fill="#e6edf3" dx="8">oomwrap run --profile vllm -- vllm serve</tspan>
+      <tspan fill="#3fb950">$</tspan><tspan fill="#e6edf3" dx="8">oomwrap run -- llama-server -m model.gguf</tspan>
     </text>
   </g>
 

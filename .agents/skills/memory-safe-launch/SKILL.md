@@ -87,15 +87,14 @@ oomwrap run \
   -- <command> [args...]
 ```
 
-Use an inference profile when it matches the engine:
+Known inference-engine commands are detected automatically:
 
 ```bash
 oomwrap run \
-  --profile sglang \
   --min-mem '<approved RAM floor>' \
   --min-swap '<approved swap floor>' \
   --event-log '<durable event-log path>' \
-  -- python -m sglang.launch_server ...
+  -- llama-server --model '<model path>'
 ```
 
 Inference profiles require active `earlyoom` by default. Keep `earlyoom` as the

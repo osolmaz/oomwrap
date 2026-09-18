@@ -11,7 +11,7 @@ engines and other memory-heavy jobs. It wraps one command, watches available RAM
 and swap, and stops the owned process group before memory pressure freezes the
 machine.
 
-Use it when an agent starts vLLM, SGLang, llama.cpp, or another inference
+Use it when an agent starts llama.cpp, SGLang, vLLM, or another inference
 engine. It also protects builds, renderers, and data jobs. oomwrap complements
 machine-wide tools such as `earlyoom`; it does not replace them.
 
@@ -103,19 +103,19 @@ allocation peaks.
 
 ## Run inference engines
 
-Choose the profile that matches the inference engine, then put the engine
+Known inference-engine commands are detected automatically. Put the engine
 command after `--`:
 
 ```bash
 oomwrap run \
-  --profile sglang \
   --min-mem 24G \
   --min-swap 4G \
-  -- python -m sglang.launch_server ...
+  -- llama-server --model model.gguf
 ```
 
 Supported profiles are `auto`, `vllm`, `llama-cpp`, `sglang`, `trtllm`, `tgi`,
 and `generic`. The inference profiles require active `earlyoom` by default. Use
+an explicit profile when a script or wrapper hides the engine command. Use
 `generic` for other commands. Use `--allow-no-earlyoom` only for tests or a
 controlled machine that has another machine-wide safety mechanism.
 
@@ -153,14 +153,14 @@ oomwrap uninstall-shims
 Use `wrap` when a benchmark or script calls a fixed runtime path:
 
 ```bash
-oomwrap wrap ~/runtimes/vllm/current/.venv/bin/vllm
+oomwrap wrap ~/runtimes/llama-cpp/current/bin/llama-server
 ```
 
-This moves the original executable to `vllm.real` and places an oomwrap-managed
-wrapper at the original path. Restore it with:
+This moves the original executable to `llama-server.real` and places an
+oomwrap-managed wrapper at the original path. Restore it with:
 
 ```bash
-oomwrap unwrap ~/runtimes/vllm/current/.venv/bin/vllm
+oomwrap unwrap ~/runtimes/llama-cpp/current/bin/llama-server
 ```
 
 ## Exit behavior
