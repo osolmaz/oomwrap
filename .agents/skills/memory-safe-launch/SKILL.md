@@ -48,8 +48,20 @@ ps -eo pid,ppid,stat,rss,etime,cmd --sort=-rss | head -25
 For a GPU workload, also run `nvidia-smi` or the platform's normal device status
 command.
 
+On macOS, use the platform tools instead:
+
+```bash
+memory_pressure
+sysctl vm.swapusage
+vm_stat
+top -l 1 -n 25 -o mem -stats pid,command,mem
+```
+
 Stop when an unrelated large process already makes the launch unsafe. Do not
 terminate another agent or process without explicit approval.
+
+On macOS, skip the oomwrap check and installation below. The `oomwrap` binary is
+Linux-only, and macOS does not use `earlyoom`.
 
 If oomwrap is absent, install it only when installation is authorized:
 
@@ -97,9 +109,16 @@ oomwrap run \
   -- llama-server --model '<model path>'
 ```
 
-Inference profiles require active `earlyoom` by default. Keep `earlyoom` as the
-machine-wide safety net. oomwrap is the process-scoped guard. Do not use
-`--allow-no-earlyoom` for a large model load.
+On Linux, inference profiles require active `earlyoom` by default. Keep
+`earlyoom` as the machine-wide safety net. oomwrap is the process-scoped guard.
+Do not use `--allow-no-earlyoom` for a large model load.
+
+On macOS, oomwrap and earlyoom do not apply: oomwrap is Linux-only, and
+earlyoom does not exist on macOS. Do not install either one there and do not
+require a machine-wide watchdog. macOS compresses memory and applies its own
+jetsam policy, so it does not freeze as hard as Linux. Use the macOS checks
+from step 3, keep the staged load, and stop the process group that this launch
+owns when pressure stays critical.
 
 ## 6. Increase load in stages
 
@@ -141,6 +160,9 @@ Inference runtimes that are promoted for repeated use can use `oomwrap wrap` or
 Treat oomwrap exit code `137` as a stopped and invalid run, not as a model or
 workload result. Preserve the event log and command log. Report the observed RAM,
 swap, process state, and last completed durable output.
+
+On macOS there is no oomwrap event log. Preserve the server log and the pressure
+readings, and treat a deliberate stop of the launch as a stopped run too.
 
 Do not retry unchanged. Reduce the workload, free an approved resource, select a
 smaller official artifact, or ask for a changed method.
