@@ -107,6 +107,12 @@ itself when the kernel kills inside it ([Stop conditions](#stop-conditions)).
 Sizes are rounded down to a whole number of pages (the page size from `sysconf`, which is not 4 KiB
 on every machine) before they go to systemd, because the kernel stores limits in pages.
 
+A probe on systemd 255 confirmed the assumptions of this section: an inherited descriptor reaches
+the program that `systemd-run --scope` executes; that program runs in the scope's cgroup; the kernel
+reads `MemoryMax=100000001` back as `99999744`, rounded down to 4 KiB pages; without `OOMPolicy`,
+`memory.oom.group` stays `0` and the job inherits the user manager's `oom_score_adj`; and a program
+started as `/proc/<pid>/exe` runs. The CI runner matrix repeats these checks on systemd 249.
+
 **The command starts once, after the check.** `exec-job` is a hidden subcommand of oomwrap. Before
 the launch, oomwrap makes a Unix socket pair and passes one end to `exec-job` as `--control-fd`.
 
@@ -183,7 +189,8 @@ Why these defaults:
   throwaway virtual machines.
 
 When only one of `--memory-high` and `--memory-max` is given, the other follows by the default
-ratio. Validation refuses `memory-high` above `memory-max` and a floor that is not below the
+ratio. An explicit `--memory-max` is used as given, also above the launch-time cap; preflight still
+refuses the launch when `domain_floor` holds. Validation refuses `memory-high` above `memory-max` and a floor that is not below the
 domain's size. `doctor` prints every resolved value and where it came from.
 
 ### Stop conditions
@@ -403,16 +410,21 @@ mutation-test skip, as 0.1.0 does today.
 
 ## Phases
 
-Each phase is one pull request that passes the checks of `AGENTS.md`.
+Each phase is one pull request that passes the checks of `AGENTS.md`, and the main branch holds a
+working tool after every phase. Users install the released crate, never the main branch: phase 1
+changes the install command of the `memory-safe-launch` skill from the Git main branch to
+`cargo install oomwrap --locked`, as the README already does first. The skill and the README keep
+describing the released version until phase 7 changes them together with the release, so no agent
+reads 0.2.0 flags while it runs 0.1.0, or the reverse.
 
 1. **Split `lib.rs`** into the modules above, with `Host`, the profile table, `EventKind`,
-   `Outcome`, one `stop` path and typed `Size` and `Duration` arguments. No change of behavior; the
-   51 existing tests pass unchanged.
+   `Outcome`, one `stop` path and typed `Size` and `Duration` arguments. `Size` keeps the parsing
+   rules of 0.1.0 until phase 2. No change of behavior; the 51 existing tests pass unchanged. The
+   skill's install command changes as above.
 2. **Policy core.** The memory domain, `Size` with shares, bounds and `infinity`, the parsers, the
    policy and its tests. The `poll` backend moves to the new policy: no swap floor, domain pressure
    and floor, shares of the domain. The machine-wide guard check. The exit-code table. CLI cutover:
-   `--min-swap`, `--require-earlyoom` and `--allow-no-earlyoom` go. The `memory-safe-launch` skill
-   in this repository changes in the same pull request.
+   `--min-swap`, `--require-earlyoom` and `--allow-no-earlyoom` go.
 3. **Launch and supervision.** `exec-job` with the handshake and the score of `1000`, job control,
    the event log changes, the schema version and `--record-readings`.
 4. **The `cgroup` backend:** the four checks, the scope launch through `/proc/<guard pid>/exe`, the
@@ -427,7 +439,8 @@ Each phase is one pull request that passes the checks of `AGENTS.md`.
    workflow, recorded job traces of a build, a renderer and a model load, the pressure defaults set
    from them, and a model load on a machine with unified GPU memory to measure whether the cgroup
    charges the GPU's allocations. The results go into this document.
-7. **Documents and release:** `README.md`, `implementation-plan.md` (its design section is replaced,
+7. **Documents and release:** `README.md`, the `memory-safe-launch` skill (its flags, floors and
+   recovery steps), `implementation-plan.md` (its design section is replaced,
    and its rule that CI never induces an out-of-memory condition is narrowed to the rule above),
    `CHANGELOG.md` with the upgrade steps, version 0.2.0. The release workflow also builds static
    binaries (`x86_64` and `aarch64`, musl), runs the test suite against those binaries, and attaches
@@ -476,6 +489,10 @@ What stays out:
   itself into a new cgroup; the command line is the contract.
 - **Compatibility flags for 0.1.0.** The cutover is hard: the old flags fail with an error, and the
   changelog and `doctor` give the upgrade steps.
+- **A third backend that writes a delegated cgroup subtree directly**, for example inside a rootless
+  container with its own cgroup namespace and no systemd. `poll` with the container's limit as the
+  domain already protects the container, and a third backend adds one more launch and stop path to
+  test. It comes back only when a user needs per-job kernel limits there.
 - **macOS and systems without Linux cgroups or PSI.** macOS stays out of scope, as in 0.1.0. A Linux
   system without systemd uses `poll`.
 
@@ -490,8 +507,10 @@ What stays out:
   down to the lowest value a privileged process set for it. A job that does so is no longer the
   first victim of a machine-wide kill; its own limits still hold.
 - **The control socket through `systemd-run`.** The handshake needs `systemd-run` to pass an
-  inherited descriptor to the program it executes. The CI runner matrix checks this on systemd 249
-  and 255.
+  inherited descriptor to the program it executes. A probe confirmed it on systemd 255; the CI
+  runner matrix checks it on systemd 249 and 255.
+- **Launch cost.** `systemd-run` adds a bus round trip to each launch. Phase 6 measures it, and the
+  default shim list stays limited to long-running tools.
 - **Domain pressure default.** `20%` for `10s` is provisional until the machine pressure traces of
   phase 6.
 - **Free room in a cgroup domain.** `memory.max − memory.current + inactive_file` approximates
