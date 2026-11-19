@@ -14,12 +14,27 @@ use crate::host::Host;
 pub(crate) const PATH_SHIM_MARKER: &str = "oomwrap managed path shim";
 pub(crate) const ABSOLUTE_WRAPPER_MARKER: &str = "oomwrap managed absolute wrapper";
 
-/// The floors that a generated script passes to `oomwrap run`. They stay text:
-/// the script quotes them as data, and `oomwrap run` parses them.
+/// The policy that a generated script passes to `oomwrap run`. It stays text:
+/// the script quotes it as data, and `oomwrap run` parses it.
 pub(crate) struct ScriptFloors<'a> {
-    pub(crate) min_mem: &'a str,
-    pub(crate) min_swap: &'a str,
+    /// `None` leaves the floor to the default of `oomwrap run`.
+    pub(crate) min_mem: Option<&'a str>,
 }
+
+/// The end of every generated script: the flags of `oomwrap run` and the exec.
+const RUN_TAIL: &str = r#"args=(run --profile "$profile")
+if [[ -n "$min_mem" ]]; then
+  args+=(--min-mem "$min_mem")
+fi
+if [[ "${OOMWRAP_ALLOW_NO_MACHINE_GUARD:-}" == "1" ]]; then
+  args+=(--allow-no-machine-guard)
+fi
+if [[ -n "${OOMWRAP_EVENT_LOG:-}" ]]; then
+  args+=(--event-log "$OOMWRAP_EVENT_LOG")
+fi
+
+exec "$oomwrap" "${args[@]}" -- "$real" "$@"
+"#;
 
 pub(crate) fn install_shims(
     bin_dir: &Path,
@@ -233,10 +248,8 @@ tool={tool_q}
 real_env={env_q}
 default_oomwrap={bin_q}
 default_min_mem={min_mem_q}
-default_min_swap={min_swap_q}
 oomwrap="${{OOMWRAP_BIN:-$default_oomwrap}}"
 min_mem="${{OOMWRAP_MIN_MEM:-$default_min_mem}}"
-min_swap="${{OOMWRAP_MIN_SWAP:-$default_min_swap}}"
 profile="${{OOMWRAP_PROFILE:-auto}}"
 real="${{!real_env:-}}"
 
@@ -262,21 +275,11 @@ if [[ -z "$real" ]]; then
   exit 127
 fi
 
-args=(run --profile "$profile" --min-mem "$min_mem" --min-swap "$min_swap")
-if [[ "${{OOMWRAP_ALLOW_NO_EARLYOOM:-}}" == "1" ]]; then
-  args+=(--allow-no-earlyoom)
-fi
-if [[ -n "${{OOMWRAP_EVENT_LOG:-}}" ]]; then
-  args+=(--event-log "$OOMWRAP_EVENT_LOG")
-fi
-
-exec "$oomwrap" "${{args[@]}}" -- "$real" "$@"
-"#,
+{RUN_TAIL}"#,
         tool_q = sh_quote(tool),
         env_q = sh_quote(&env_name),
         bin_q = sh_quote(&oomwrap_bin.display().to_string()),
-        min_mem_q = sh_quote(floors.min_mem),
-        min_swap_q = sh_quote(floors.min_swap),
+        min_mem_q = sh_quote(floors.min_mem.unwrap_or_default()),
     )
 }
 
@@ -288,26 +291,14 @@ set -euo pipefail
 
 default_oomwrap={bin_q}
 default_min_mem={min_mem_q}
-default_min_swap={min_swap_q}
 oomwrap="${{OOMWRAP_BIN:-$default_oomwrap}}"
 min_mem="${{OOMWRAP_MIN_MEM:-$default_min_mem}}"
-min_swap="${{OOMWRAP_MIN_SWAP:-$default_min_swap}}"
 profile="${{OOMWRAP_PROFILE:-auto}}"
 real="$(readlink -f "${{BASH_SOURCE[0]}}").real"
 
-args=(run --profile "$profile" --min-mem "$min_mem" --min-swap "$min_swap")
-if [[ "${{OOMWRAP_ALLOW_NO_EARLYOOM:-}}" == "1" ]]; then
-  args+=(--allow-no-earlyoom)
-fi
-if [[ -n "${{OOMWRAP_EVENT_LOG:-}}" ]]; then
-  args+=(--event-log "$OOMWRAP_EVENT_LOG")
-fi
-
-exec "$oomwrap" "${{args[@]}}" -- "$real" "$@"
-"#,
+{RUN_TAIL}"#,
         bin_q = sh_quote(&oomwrap_bin.display().to_string()),
-        min_mem_q = sh_quote(floors.min_mem),
-        min_swap_q = sh_quote(floors.min_swap),
+        min_mem_q = sh_quote(floors.min_mem.unwrap_or_default()),
     )
 }
 
@@ -333,11 +324,9 @@ mod tests {
 
     use super::*;
     use crate::host::{Host, disk_available};
-    use crate::limits::format_bytes;
 
     const FLOORS: ScriptFloors<'static> = ScriptFloors {
-        min_mem: "24G",
-        min_swap: "4G",
+        min_mem: Some("24G"),
     };
 
     #[test]
@@ -359,14 +348,6 @@ mod tests {
         let default_bin = default_bin_dir(&host).unwrap();
         assert!(default_bin.ends_with(".local/bin"));
         assert!(default_bin.starts_with(host.home().unwrap()));
-        assert_eq!(format_bytes(7), "7B");
-        assert_eq!(format_bytes(4096), "4096B");
-        assert_eq!(format_bytes(1024 * 1024), "1.0MiB");
-        assert_eq!(format_bytes(2 * 1024 * 1024), "2.0MiB");
-        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0MiB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0GiB");
-        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0GiB");
-        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0GiB");
 
         let dir = tempfile::tempdir().unwrap();
         assert!(!is_managed_path_shim(&dir.path().join("missing")).unwrap());
@@ -422,7 +403,15 @@ mod tests {
         assert!(script.contains(PATH_SHIM_MARKER));
         assert!(script.contains("oomwrap managed"));
         assert!(script.contains("OOMWRAP_REAL_VLLM"));
-        assert!(script.contains("OOMWRAP_ALLOW_NO_EARLYOOM"));
+        assert!(script.contains("OOMWRAP_ALLOW_NO_MACHINE_GUARD"));
+        assert!(script.contains("default_min_mem='24G'"));
+        assert!(script.ends_with(RUN_TAIL));
+        let without_floor = path_shim_script(
+            "vllm",
+            Path::new("/tmp/oomwrap"),
+            &ScriptFloors { min_mem: None },
+        );
+        assert!(without_floor.contains("default_min_mem=''"));
     }
 
     #[test]
@@ -431,7 +420,8 @@ mod tests {
         assert!(script.contains(ABSOLUTE_WRAPPER_MARKER));
         assert!(script.contains("readlink -f"));
         assert!(script.contains(".real"));
-        assert!(script.contains("OOMWRAP_ALLOW_NO_EARLYOOM"));
+        assert!(script.contains("default_min_mem='24G'"));
+        assert!(script.ends_with(RUN_TAIL));
     }
 
     #[test]

@@ -32,7 +32,9 @@ pub(crate) struct ProfileSpec {
     pub(crate) python_modules: &'static [&'static str],
     /// Text that marks the engine anywhere in the program path.
     pub(crate) path_markers: &'static [&'static str],
-    pub(crate) requires_earlyoom: bool,
+    /// A large model load can also cause driver-level allocation pressure,
+    /// so the profile refuses to launch without a machine-wide guard.
+    pub(crate) requires_machine_guard: bool,
 }
 
 const fn shim(name: &'static str) -> Executable {
@@ -56,35 +58,35 @@ pub(crate) const PROFILES: &[ProfileSpec] = &[
         executables: &[shim("vllm"), no_shim("api_server"), no_shim("gpu_worker")],
         python_modules: &["vllm"],
         path_markers: &[],
-        requires_earlyoom: true,
+        requires_machine_guard: true,
     },
     ProfileSpec {
         profile: Profile::LlamaCpp,
         executables: &[shim("llama-server"), shim("llama-cli"), shim("llama-bench")],
         python_modules: &[],
         path_markers: &[],
-        requires_earlyoom: true,
+        requires_machine_guard: true,
     },
     ProfileSpec {
         profile: Profile::Sglang,
         executables: &[shim("sglang")],
         python_modules: &["sglang"],
         path_markers: &[],
-        requires_earlyoom: true,
+        requires_machine_guard: true,
     },
     ProfileSpec {
         profile: Profile::Trtllm,
         executables: &[shim("trtllm-serve")],
         python_modules: &[],
         path_markers: &["TensorRT-LLM"],
-        requires_earlyoom: true,
+        requires_machine_guard: true,
     },
     ProfileSpec {
         profile: Profile::Tgi,
         executables: &[shim("text-generation-launcher")],
         python_modules: &[],
         path_markers: &[],
-        requires_earlyoom: true,
+        requires_machine_guard: true,
     },
 ];
 
@@ -92,10 +94,17 @@ pub(crate) const PROFILES: &[ProfileSpec] = &[
 pub(crate) const OTHER_HEAVY_PROCESSES: &[&str] = &["ollama", "lmstudio", "torchrun"];
 
 impl Profile {
-    pub(crate) fn requires_earlyoom(self) -> bool {
+    /// The name as `--profile` spells it.
+    pub(crate) fn name(self) -> String {
+        self.to_possible_value()
+            .map(|value| value.get_name().to_string())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn requires_machine_guard(self) -> bool {
         PROFILES
             .iter()
-            .any(|spec| spec.profile == self && spec.requires_earlyoom)
+            .any(|spec| spec.profile == self && spec.requires_machine_guard)
     }
 }
 
@@ -266,12 +275,14 @@ mod tests {
 
     #[test]
     fn profile_requirements_are_conservative() {
-        assert!(Profile::Vllm.requires_earlyoom());
-        assert!(Profile::LlamaCpp.requires_earlyoom());
-        assert!(Profile::Sglang.requires_earlyoom());
-        assert!(Profile::Trtllm.requires_earlyoom());
-        assert!(Profile::Tgi.requires_earlyoom());
-        assert!(!Profile::Generic.requires_earlyoom());
+        assert!(Profile::Vllm.requires_machine_guard());
+        assert!(Profile::LlamaCpp.requires_machine_guard());
+        assert!(Profile::Sglang.requires_machine_guard());
+        assert!(Profile::Trtllm.requires_machine_guard());
+        assert!(Profile::Tgi.requires_machine_guard());
+        assert!(!Profile::Generic.requires_machine_guard());
+        assert_eq!(Profile::LlamaCpp.name(), "llama-cpp");
+        assert_eq!(Profile::Vllm.name(), "vllm");
         assert_eq!(
             effective_profile(Profile::Generic, &["vllm".into()]),
             Profile::Generic
