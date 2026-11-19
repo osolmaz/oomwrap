@@ -190,8 +190,9 @@ Why these defaults:
 
 When only one of `--memory-high` and `--memory-max` is given, the other follows by the default
 ratio. An explicit `--memory-max` is used as given, also above the launch-time cap; preflight still
-refuses the launch when `domain_floor` holds. Validation refuses `memory-high` above `memory-max` and a floor that is not below the
-domain's size. `doctor` prints every resolved value and where it came from.
+refuses the launch when `domain_floor` holds. Validation refuses `memory-high` above `memory-max`
+and a floor that is not below the domain's size. `doctor` prints every resolved value and where it
+came from.
 
 ### Stop conditions
 
