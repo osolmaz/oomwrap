@@ -17,21 +17,26 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
 use crate::backend::ProcessGroup;
 use crate::config::{Profile, effective_profile};
+use crate::domain::{Domain, MemoryDomain};
 use crate::events::{Event, EventKind, EventLabel, EventLogger};
 use crate::host::Host;
-use crate::limits::format_bytes;
-use crate::policy::{Floors, StopReason, evaluate};
-use crate::readings::MemInfo;
+use crate::limits::{GuardPolicy, StopLimits, format_bytes};
+use crate::policy::{Decision, PressureWindow, StopReason, preflight};
+use crate::readings::{DomainReadings, Readings};
 use terminal::{TerminalForeground, restore_terminal};
 
 /// The exit code of a job that the guard stopped.
 const STOPPED_EXIT_CODE: i32 = 137;
 /// The base of the exit code for a job that ended on a signal.
 const SIGNAL_EXIT_BASE: i32 = 128;
+/// oomwrap cannot guard as asked.
+const CANNOT_GUARD_EXIT_CODE: i32 = 3;
+/// Preflight refused the launch: no room in the domain now.
+const PREFLIGHT_EXIT_CODE: i32 = 4;
 
-/// Whether a run needs an active `earlyoom`.
+/// Whether a run needs a machine-wide guard.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EarlyoomRequirement {
+pub(crate) enum MachineGuardRequirement {
     /// The profile decides.
     ProfileDefault,
     Required,
@@ -40,10 +45,10 @@ pub(crate) enum EarlyoomRequirement {
 
 pub(crate) struct RunOptions {
     pub(crate) profile: Profile,
-    pub(crate) floors: Floors,
+    pub(crate) policy: GuardPolicy,
     pub(crate) poll: Duration,
     pub(crate) term_grace: Duration,
-    pub(crate) earlyoom: EarlyoomRequirement,
+    pub(crate) machine_guard: MachineGuardRequirement,
     pub(crate) event_log: Option<PathBuf>,
     pub(crate) command: Vec<OsString>,
 }
@@ -51,7 +56,9 @@ pub(crate) struct RunOptions {
 /// Why `oomwrap run` refused to launch the command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Refusal {
-    EarlyoomMissing,
+    /// A required machine-wide guard is not active.
+    NoMachineGuard,
+    /// A domain condition already holds.
     Preflight(StopReason),
 }
 
@@ -71,8 +78,8 @@ impl Outcome {
     pub(crate) fn exit_code(self) -> i32 {
         match self {
             Self::Exited(code) => code,
-            Self::Refused(Refusal::EarlyoomMissing) => 3,
-            Self::Refused(Refusal::Preflight(_)) => 4,
+            Self::Refused(Refusal::NoMachineGuard) => CANNOT_GUARD_EXIT_CODE,
+            Self::Refused(Refusal::Preflight(_)) => PREFLIGHT_EXIT_CODE,
             Self::Stopped(_) => STOPPED_EXIT_CODE,
             Self::Interrupted(signal) => SIGNAL_EXIT_BASE + signal,
         }
@@ -82,37 +89,43 @@ impl Outcome {
 pub(crate) fn run(options: RunOptions, host: &Host) -> Result<Outcome> {
     let command = command_strings(&options.command);
     let profile = effective_profile(options.profile, &command);
-    let require_earlyoom = match options.earlyoom {
-        EarlyoomRequirement::ProfileDefault => profile.requires_earlyoom(),
-        EarlyoomRequirement::Required => true,
-        EarlyoomRequirement::NotRequired => false,
-    };
-
     let mut logger = EventLogger::new(options.event_log.as_deref())?;
-    logger.log(Event::new(EventKind::Preflight, EventLabel::Run).with_command(command.clone()))?;
+    let memory = MemoryDomain::find(host)?;
+    let domain = &memory.domain;
+    logger.log(
+        Event::new(EventKind::Preflight, EventLabel::Run)
+            .with_command(command.clone())
+            .with_domain(domain),
+    )?;
 
-    if require_earlyoom && !host.earlyoom_active()? {
+    if needs_machine_guard(options.machine_guard, profile)
+        && host
+            .machine_guards(host.own_cgroup()?.as_deref())?
+            .is_empty()
+    {
+        let message = missing_guard_message(profile, host.in_container);
         logger.log(
-            Event::new(EventKind::Refused, EventLabel::Earlyoom)
-                .with_command(command.clone())
-                .with_detail("earlyoom is required but not active"),
+            Event::new(EventKind::Refused, EventLabel::MachineGuard)
+                .with_command(command)
+                .with_domain(domain)
+                .with_detail(message.clone()),
         )?;
-        eprintln!("refusing to launch: earlyoom is required for profile {profile:?}");
-        return Ok(Outcome::Refused(Refusal::EarlyoomMissing));
+        eprintln!("refusing to launch: {message}");
+        return Ok(Outcome::Refused(Refusal::NoMachineGuard));
     }
 
-    let mem = host.read_meminfo()?;
-    if let Some(reason) = evaluate(&options.floors, &mem) {
+    let readings = memory.read(host)?;
+    let limits = options.policy.resolve(readings.size_bytes)?;
+    if let Some(reason) = preflight(&limits, &readings) {
+        let message = describe(reason, domain, &readings, &limits);
         logger.log(
-            Event::new(EventKind::Refused, refusal_label(reason))
-                .with_command(command.clone())
-                .with_mem(mem)
-                .with_detail(refusal_detail(reason)),
+            Event::new(EventKind::Refused, EventLabel::Reason(reason))
+                .with_command(command)
+                .with_domain(domain)
+                .with_readings(readings)
+                .with_detail(message.clone()),
         )?;
-        eprintln!(
-            "refusing to launch: {}",
-            below_floor(reason, "is below floor")
-        );
+        eprintln!("refusing to launch: {message}");
         return Ok(Outcome::Refused(Refusal::Preflight(reason)));
     }
 
@@ -123,6 +136,7 @@ pub(crate) fn run(options: RunOptions, host: &Host) -> Result<Outcome> {
         terminal: None,
         logger,
         command,
+        memory,
         term_grace: options.term_grace,
     };
     match TerminalForeground::handoff_to_child(supervisor.group.pgid()) {
@@ -131,12 +145,63 @@ pub(crate) fn run(options: RunOptions, host: &Host) -> Result<Outcome> {
     }
     let launched = supervisor.event(EventKind::Launched);
     supervisor.logger.log_or_warn(launched);
-    supervisor.watch(host, &options.floors, options.poll, &signals)
+    supervisor.watch(host, &limits, options.poll, &signals)
+}
+
+fn needs_machine_guard(requirement: MachineGuardRequirement, profile: Profile) -> bool {
+    match requirement {
+        MachineGuardRequirement::ProfileDefault => profile.requires_machine_guard(),
+        MachineGuardRequirement::Required => true,
+        MachineGuardRequirement::NotRequired => false,
+    }
+}
+
+fn missing_guard_message(profile: Profile, in_container: bool) -> String {
+    let mut message = format!(
+        "profile {} requires a machine-wide guard (earlyoom, or systemd-oomd watching this job), and none is active",
+        profile.name()
+    );
+    if in_container {
+        message.push_str(
+            "; inside a container, a guard of the host is not visible: pass --allow-no-machine-guard when the host runs one",
+        );
+    }
+    message
+}
+
+/// Explains a stop or a refusal with the reading and the limit behind it.
+fn describe(
+    reason: StopReason,
+    domain: &Domain,
+    readings: &DomainReadings,
+    limits: &StopLimits,
+) -> String {
+    match reason {
+        StopReason::DomainFloor => format!(
+            "{reason}: the memory domain ({domain}) has {} free, below --min-mem {}",
+            format_bytes(readings.free_bytes),
+            format_bytes(limits.min_free_bytes)
+        ),
+        StopReason::DomainPressure => format!(
+            "{reason}: memory pressure of the domain ({domain}) is {}, at or above --domain-pressure {}",
+            readings
+                .full_avg10
+                .map_or_else(|| "unknown".to_string(), |pressure| pressure.to_string()),
+            limits.domain_pressure.at_least
+        ),
+        StopReason::JobLimit | StopReason::OutsideOomKill | StopReason::JobPressure => {
+            reason.to_string()
+        }
+    }
 }
 
 /// Why the supervisor ends the job early.
 enum StopCause {
-    Pressure { reason: StopReason, mem: MemInfo },
+    Pressure {
+        reason: StopReason,
+        readings: Readings,
+        message: String,
+    },
     Signal(i32),
     GuardError(anyhow::Error),
 }
@@ -146,6 +211,7 @@ struct Supervisor {
     terminal: Option<TerminalForeground>,
     logger: EventLogger,
     command: Vec<String>,
+    memory: MemoryDomain,
     term_grace: Duration,
 }
 
@@ -153,10 +219,12 @@ impl Supervisor {
     fn watch(
         &mut self,
         host: &Host,
-        floors: &Floors,
+        limits: &StopLimits,
         poll: Duration,
         signals: &ShutdownSignals,
     ) -> Result<Outcome> {
+        let started = Instant::now();
+        let mut window = PressureWindow::default();
         loop {
             if let Some(signal) = signals.pending() {
                 return self.stop(StopCause::Signal(signal));
@@ -166,12 +234,21 @@ impl Supervisor {
                 Ok(None) => {}
                 Err(error) => return self.stop(StopCause::GuardError(anyhow!(error))),
             }
-            let mem = match host.read_meminfo() {
-                Ok(mem) => mem,
+            let readings = match self.memory.read(host) {
+                Ok(domain) => Readings {
+                    elapsed_ms: elapsed_ms(started),
+                    domain,
+                    job: None,
+                },
                 Err(error) => return self.stop(StopCause::GuardError(error)),
             };
-            if let Some(reason) = evaluate(floors, &mem) {
-                return self.stop(StopCause::Pressure { reason, mem });
+            if let Decision::Stop(reason) = Decision::evaluate(limits, &readings, &mut window) {
+                let message = describe(reason, &self.memory.domain, &readings.domain, limits);
+                return self.stop(StopCause::Pressure {
+                    reason,
+                    readings,
+                    message,
+                });
             }
             match sleep_until_poll_signal_or_exit(poll, signals, &mut self.group) {
                 Ok(Some(status)) => return self.finish(status),
@@ -202,14 +279,19 @@ impl Supervisor {
         restore_terminal(&mut self.terminal);
         let pgid = self.group.pgid();
         match &cause {
-            StopCause::Pressure { reason, mem } => {
-                let detail = below_floor(*reason, "below floor");
-                let event = self
-                    .event(EventKind::MemoryPressureKill)
-                    .with_mem(*mem)
-                    .with_detail(detail.clone());
+            StopCause::Pressure {
+                reason,
+                readings,
+                message,
+            } => {
+                let event = Event::new(EventKind::MemoryPressureKill, EventLabel::Reason(*reason))
+                    .with_command(self.command.clone())
+                    .with_pid(self.group.leader_pid())
+                    .with_domain(&self.memory.domain)
+                    .with_readings(readings.domain)
+                    .with_detail(message.clone());
                 self.logger.log_or_warn(event);
-                eprintln!("memory pressure: {detail}; terminating process group {pgid}");
+                eprintln!("memory pressure: {message}; terminating process group {pgid}");
             }
             StopCause::Signal(signal) => {
                 let event = self
@@ -245,40 +327,12 @@ impl Supervisor {
         Event::new(kind, EventLabel::Run)
             .with_command(self.command.clone())
             .with_pid(self.group.leader_pid())
+            .with_domain(&self.memory.domain)
     }
 }
 
-fn refusal_label(reason: StopReason) -> EventLabel {
-    match reason {
-        StopReason::MemAvailable { .. } => EventLabel::Memory,
-        StopReason::SwapFree { .. } => EventLabel::Swap,
-    }
-}
-
-fn refusal_detail(reason: StopReason) -> &'static str {
-    match reason {
-        StopReason::MemAvailable { .. } => "MemAvailable is below the configured floor",
-        StopReason::SwapFree { .. } => "SwapFree is below the configured floor",
-    }
-}
-
-/// Formats a floor reason as "`MemAvailable 1.0MiB <relation> 2.0MiB`".
-fn below_floor(reason: StopReason, relation: &str) -> String {
-    let (name, observed, floor) = match reason {
-        StopReason::MemAvailable {
-            observed_bytes,
-            floor_bytes,
-        } => ("MemAvailable", observed_bytes, floor_bytes),
-        StopReason::SwapFree {
-            observed_bytes,
-            floor_bytes,
-        } => ("SwapFree", observed_bytes, floor_bytes),
-    };
-    format!(
-        "{name} {} {relation} {}",
-        format_bytes(observed),
-        format_bytes(floor)
-    )
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The shutdown signals that oomwrap forwards as a stop of the job.
@@ -354,72 +408,95 @@ fn status_to_code(status: ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::read_process_group_id;
-    use crate::host::{command_invokes_executable, read_cmdline, read_rss_bytes};
-    use crate::readings::parse_process_group_id;
+    use crate::limits::{Pressure, PressureLimit};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
 
     #[test]
-    fn command_and_proc_helpers_parse_expected_shapes() {
+    fn splits_command_strings() {
         let command = command_strings(&[OsString::from("vllm"), OsString::from("serve")]);
         assert_eq!(command, vec!["vllm".to_string(), "serve".to_string()]);
-        assert!(command_invokes_executable(
-            "/usr/bin/earlyoom -m 5",
-            "earlyoom"
-        ));
-        assert!(command_invokes_executable("earlyoom -m 5", "earlyoom"));
-        assert!(!command_invokes_executable(
-            "oomwrap run --require-earlyoom",
-            "earlyoom"
-        ));
-        assert!(!command_invokes_executable(
-            "python3 -c 'earlyoom'",
-            "earlyoom"
-        ));
-
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("cmdline"), b"vllm\0serve\0").unwrap();
-        std::fs::write(
-            dir.path().join("status"),
-            "Name:\tvllm\nVmRSS:\t42 kB\nState:\tS\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("stat"), "123 (vllm worker) S 1 456 456 0\n").unwrap();
-        assert_eq!(read_cmdline(dir.path()).unwrap(), "vllm serve");
-        assert_eq!(read_rss_bytes(dir.path()).unwrap(), Some(42 * 1024));
-        assert_eq!(read_process_group_id(dir.path()).unwrap(), 456);
-        assert_eq!(
-            parse_process_group_id("123 (name with spaces) S 1 789 789 0").unwrap(),
-            789
-        );
     }
 
     #[test]
     fn outcomes_map_to_exit_codes() {
-        let reason = StopReason::SwapFree {
-            observed_bytes: 1,
-            floor_bytes: 2,
-        };
+        let reason = StopReason::DomainFloor;
         assert_eq!(Outcome::Exited(7).exit_code(), 7);
-        assert_eq!(Outcome::Refused(Refusal::EarlyoomMissing).exit_code(), 3);
+        assert_eq!(Outcome::Refused(Refusal::NoMachineGuard).exit_code(), 3);
         assert_eq!(Outcome::Refused(Refusal::Preflight(reason)).exit_code(), 4);
         assert_eq!(Outcome::Stopped(reason).exit_code(), 137);
         assert_eq!(Outcome::Interrupted(15).exit_code(), 143);
     }
 
     #[test]
-    fn floor_messages_name_the_value_and_the_floor() {
-        let reason = StopReason::MemAvailable {
-            observed_bytes: 1024 * 1024,
-            floor_bytes: 2 * 1024 * 1024,
+    fn the_requirement_or_the_profile_decides_the_machine_guard() {
+        use MachineGuardRequirement::{NotRequired, ProfileDefault, Required};
+        assert!(needs_machine_guard(ProfileDefault, Profile::Vllm));
+        assert!(!needs_machine_guard(ProfileDefault, Profile::Generic));
+        assert!(needs_machine_guard(Required, Profile::Generic));
+        assert!(!needs_machine_guard(NotRequired, Profile::Vllm));
+    }
+
+    #[test]
+    fn the_missing_guard_message_explains_a_container() {
+        let host_message = missing_guard_message(Profile::LlamaCpp, false);
+        assert!(host_message.starts_with("profile llama-cpp requires a machine-wide guard"));
+        assert!(!host_message.contains("container"));
+        assert!(missing_guard_message(Profile::Vllm, true).contains("inside a container"));
+    }
+
+    #[test]
+    fn descriptions_name_the_reading_and_the_limit() {
+        let limits = StopLimits {
+            min_free_bytes: 2 * GIB,
+            job_pressure: PressureLimit {
+                at_least: Pressure::from_hundredths(6000).unwrap(),
+                lasting: Duration::from_secs(30),
+            },
+            domain_pressure: PressureLimit {
+                at_least: Pressure::from_hundredths(2000).unwrap(),
+                lasting: Duration::from_secs(10),
+            },
+        };
+        let readings = DomainReadings {
+            size_bytes: 16 * GIB,
+            free_bytes: GIB,
+            full_avg10: Pressure::from_hundredths(2550),
         };
         assert_eq!(
-            below_floor(reason, "below floor"),
-            "MemAvailable 1.0MiB below floor 2.0MiB"
+            describe(
+                StopReason::DomainFloor,
+                &Domain::Machine,
+                &readings,
+                &limits
+            ),
+            "domain_floor: the memory domain (machine) has 1.0GiB free, below --min-mem 2.0GiB"
         );
-        assert_eq!(refusal_label(reason), EventLabel::Memory);
         assert_eq!(
-            refusal_detail(reason),
-            "MemAvailable is below the configured floor"
+            describe(
+                StopReason::DomainPressure,
+                &Domain::Machine,
+                &readings,
+                &limits
+            ),
+            "domain_pressure: memory pressure of the domain (machine) is 25.50%, at or above --domain-pressure 20.00%"
+        );
+        let no_psi = DomainReadings {
+            full_avg10: None,
+            ..readings
+        };
+        assert!(
+            describe(
+                StopReason::DomainPressure,
+                &Domain::Machine,
+                &no_psi,
+                &limits
+            )
+            .contains("is unknown")
+        );
+        assert_eq!(
+            describe(StopReason::JobLimit, &Domain::Machine, &readings, &limits),
+            "job_limit"
         );
     }
 }

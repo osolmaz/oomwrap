@@ -35,16 +35,22 @@ not a low swap counter. The kernel measures that waiting directly in its pressur
 
 ### The memory domain
 
-The memory domain is the memory that the job competes for: the closest cgroup above the caller that
-has a `memory.max`, or the whole machine when there is none. In a container or a limited service,
-`/proc/meminfo` and `/proc/pressure/memory` describe the host, not the memory that binds, so the
-domain decides what oomwrap reads:
+The memory domain is the memory that the job competes for. Of the machine and every cgroup at or
+above the caller that has a `memory.max`, it is the one with the smallest size. In a container or a
+limited service, `/proc/meminfo` and `/proc/pressure/memory` describe the host, not the memory that
+binds, so the domain decides what oomwrap reads:
 
 | Reading | Machine domain | Cgroup domain |
 | --- | --- | --- |
 | Size | `MemTotal` minus `Hugetlb` | `memory.max` |
 | Free room | `MemAvailable` | `memory.max` − `memory.current` + `inactive_file` from `memory.stat` |
 | Pressure | `/proc/pressure/memory` | the domain's `memory.pressure` |
+
+The free room is the smallest free room of the machine and of every limited cgroup on the path,
+because the job can grow only until the first limit binds. The closest limited cgroup is not always
+that limit: an outer cgroup can have a smaller `memory.max`, or siblings that use most of a larger
+one, and a `memory.max` above the machine's RAM never binds. (The first version of this plan took
+the closest cgroup; phase 2 changed it for these cases.)
 
 Every share in the policy (`85%`, `15%`) is a share of the domain's size. A job's own limit can
 never exceed its domain. Reserved huge pages are not usable by the job, so the machine domain leaves
@@ -276,7 +282,7 @@ backend leaves the job unguarded, as 0.1.0 does.
 | Code | Meaning |
 | --- | --- |
 | The command's code | The command ended on its own |
-| 2 | Invalid arguments or policy file |
+| 2 | Invalid arguments or policy file, or a guard error after the launch: oomwrap could no longer read the domain, and ended the job first |
 | 3 | oomwrap cannot guard as asked: a required machine-wide guard, the required backend or an explicit limit is not available. The event and the message name which |
 | 4 | Preflight refused the launch: no room in the domain now |
 | 126, 127 | The command could not be run, or was not found |
@@ -343,7 +349,7 @@ system code (`AGENTS.md`):
 | `signal` | `ProcessId`, which holds only IDs greater than 1, and the only calls of `kill` and `killpg` | signals |
 | `host` | `Host`: the proc root, the cgroup root, the `systemd-run` program, the page size and the machine-guard check, built once at the border; tests build a fake one | file reads |
 | `domain` | Finding the memory domain and the caller's limits | file reads |
-| `policy` | `Decision::evaluate(&Limits, &Readings, &mut PressureWindow)` and `StopReason` | none |
+| `policy` | `Decision::evaluate(&StopLimits, &Readings, &mut PressureWindow)`, the preflight check and `StopReason` | none |
 | `launch` | `exec-job` and the handshake | process |
 | `backend` | `enum Backend { Cgroup(Scope), Poll(ProcessGroup) }`: launch, readings source, stop sequence | process and cgroup |
 | `supervise` | The loop: signals, job control, terminal foreground, events, and one `stop(StopReason)` path | yes |
@@ -442,7 +448,13 @@ reads 0.2.0 flags while it runs 0.1.0, or the reverse.
 2. **Policy core.** The memory domain, `Size` with shares, bounds and `infinity`, the parsers, the
    policy and its tests. The `poll` backend moves to the new policy: no swap floor, domain pressure
    and floor, shares of the domain. The machine-wide guard check. The exit-code table. CLI cutover:
-   `--min-swap`, `--require-earlyoom` and `--allow-no-earlyoom` go.
+   `--min-swap`, `--require-earlyoom` and `--allow-no-earlyoom` go, and an unknown flag before the
+   command is an error instead of the start of the command, so an old flag never runs as a
+   program. The test seam `OOMWRAP_EARLYOOM_ACTIVE` becomes `OOMWRAP_MACHINE_GUARD_ACTIVE`. Until
+   phase 5 replaces them, shims and wrappers pass `--min-mem` only when `install-shims` or `wrap`
+   got one, and `OOMWRAP_ALLOW_NO_MACHINE_GUARD=1` passes `--allow-no-machine-guard`. The
+   `--job-pressure` flags come with the `cgroup` backend in phase 4, because only that backend
+   reads the job's own pressure.
 3. **Launch and supervision.** `exec-job` with the handshake and the score of `1000`, job control,
    the event log changes, the schema version and `--record-readings`.
 4. **The `cgroup` backend:** the four checks, the scope launch through `/proc/<guard pid>/exe`, the

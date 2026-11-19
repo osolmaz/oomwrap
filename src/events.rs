@@ -8,7 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::readings::MemInfo;
+use crate::domain::Domain;
+use crate::policy::StopReason;
+use crate::readings::DomainReadings;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,14 +24,15 @@ pub(crate) enum EventKind {
     ParentSignalKill,
 }
 
-/// What an event is about: the run, or the check that refused it.
+/// What an event is about: the run, the check that refused it, or the
+/// reason of a stop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EventLabel {
     Run,
-    Earlyoom,
-    Memory,
-    Swap,
+    MachineGuard,
+    #[serde(untagged)]
+    Reason(StopReason),
 }
 
 #[derive(Debug, Serialize)]
@@ -40,8 +43,8 @@ pub(crate) struct Event {
     pid: Option<u32>,
     command: Vec<String>,
     detail: Option<String>,
-    mem_available_bytes: Option<u64>,
-    swap_free_bytes: Option<u64>,
+    domain: Option<Domain>,
+    readings: Option<DomainReadings>,
     exit_code: Option<i32>,
 }
 
@@ -57,8 +60,8 @@ impl Event {
             pid: None,
             command: Vec::new(),
             detail: None,
-            mem_available_bytes: None,
-            swap_free_bytes: None,
+            domain: None,
+            readings: None,
             exit_code: None,
         }
     }
@@ -78,9 +81,13 @@ impl Event {
         self
     }
 
-    pub(crate) fn with_mem(mut self, mem: MemInfo) -> Self {
-        self.mem_available_bytes = Some(mem.mem_available_bytes);
-        self.swap_free_bytes = Some(mem.swap_free_bytes);
+    pub(crate) fn with_domain(mut self, domain: &Domain) -> Self {
+        self.domain = Some(domain.clone());
+        self
+    }
+
+    pub(crate) fn with_readings(mut self, readings: DomainReadings) -> Self {
+        self.readings = Some(readings);
         self
     }
 
@@ -146,15 +153,20 @@ mod tests {
                     .with_pid(7)
                     .with_command(vec!["true".into()])
                     .with_detail("done")
-                    .with_mem(MemInfo {
-                        mem_available_bytes: 1,
-                        swap_free_bytes: 2,
+                    .with_domain(&Domain::Machine)
+                    .with_readings(DomainReadings {
+                        size_bytes: 4,
+                        free_bytes: 2,
+                        full_avg10: None,
                     })
                     .with_exit(3),
             )
             .unwrap();
         logger
-            .log(Event::new(EventKind::Refused, EventLabel::Swap))
+            .log(Event::new(
+                EventKind::Refused,
+                EventLabel::Reason(StopReason::DomainFloor),
+            ))
             .unwrap();
         let text = fs::read_to_string(&path).unwrap();
         let lines: Vec<serde_json::Value> = text
@@ -166,10 +178,15 @@ mod tests {
         assert_eq!(lines[0]["label"], "run");
         assert_eq!(lines[0]["pid"], 7);
         assert_eq!(lines[0]["detail"], "done");
-        assert_eq!(lines[0]["swap_free_bytes"], 2);
+        assert_eq!(lines[0]["domain"]["kind"], "machine");
+        assert_eq!(lines[0]["readings"]["free_bytes"], 2);
         assert_eq!(lines[0]["exit_code"], 3);
         assert_eq!(lines[1]["event"], "refused");
-        assert_eq!(lines[1]["label"], "swap");
+        assert_eq!(lines[1]["label"], "domain_floor");
+        assert_eq!(
+            serde_json::to_value(EventLabel::MachineGuard).unwrap(),
+            "machine_guard"
+        );
     }
 
     #[test]

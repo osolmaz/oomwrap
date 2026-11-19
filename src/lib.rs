@@ -5,6 +5,7 @@ mod backend;
 mod cli;
 mod config;
 mod doctor;
+mod domain;
 mod events;
 mod host;
 mod limits;

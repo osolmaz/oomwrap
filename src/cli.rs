@@ -12,14 +12,11 @@ use clap::{Args, Parser, Subcommand};
 use crate::config::Profile;
 use crate::doctor::{self, Defaults};
 use crate::host::Host;
-use crate::limits::{Size, parse_duration};
-use crate::policy::Floors;
+use crate::limits::{GuardPolicy, Pressure, PressureLimit, Size, SizeSetting, parse_duration};
 use crate::shims::{self, ScriptFloors, default_bin_dir};
-use crate::supervise::{self, EarlyoomRequirement, RunOptions};
+use crate::supervise::{self, MachineGuardRequirement, RunOptions};
 
 const DEFAULTS: Defaults = Defaults {
-    min_mem: "24G",
-    min_swap: "4G",
     poll: "1s",
     term_grace: "10s",
 };
@@ -59,23 +56,30 @@ struct RunArgs {
     #[arg(long, value_enum, default_value_t = Profile::Auto)]
     profile: Profile,
 
-    #[arg(long, default_value = DEFAULTS.min_mem)]
-    min_mem: Size,
+    /// Floor for the memory domain's free room [default: 15%, at least 256M, at most 16G]
+    #[arg(long)]
+    min_mem: Option<Size>,
 
-    #[arg(long, default_value = DEFAULTS.min_swap)]
-    min_swap: Size,
+    /// PSI `full avg10` limit of the memory domain [default: 20%]
+    #[arg(long)]
+    domain_pressure: Option<Pressure>,
 
-    #[arg(long, default_value = DEFAULTS.poll, value_parser = parse_duration)]
+    /// How long the domain's pressure must last before a stop [default: 10s]
+    // A negative number reaches the parser, which names the flag and the fault.
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_duration)]
+    domain_pressure_for: Option<Duration>,
+
+    #[arg(long, allow_negative_numbers = true, default_value = DEFAULTS.poll, value_parser = parse_duration)]
     poll: Duration,
 
-    #[arg(long, default_value = DEFAULTS.term_grace, value_parser = parse_duration)]
+    #[arg(long, allow_negative_numbers = true, default_value = DEFAULTS.term_grace, value_parser = parse_duration)]
     term_grace: Duration,
 
-    #[arg(long, conflicts_with = "allow_no_earlyoom")]
-    require_earlyoom: bool,
+    #[arg(long, conflicts_with = "allow_no_machine_guard")]
+    require_machine_guard: bool,
 
-    #[arg(long, conflicts_with = "require_earlyoom")]
-    allow_no_earlyoom: bool,
+    #[arg(long, conflicts_with = "require_machine_guard")]
+    allow_no_machine_guard: bool,
 
     #[arg(long)]
     event_log: Option<PathBuf>,
@@ -89,7 +93,9 @@ struct RunArgs {
     #[arg(long)]
     memory_max: Option<Size>,
 
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    /// The command starts at its first word; an unknown flag before it is an
+    /// error, never the command.
+    #[arg(required = true, trailing_var_arg = true)]
     command: Vec<OsString>,
 }
 
@@ -101,11 +107,9 @@ struct InstallShimsArgs {
     #[arg(long = "tool")]
     tools: Vec<String>,
 
-    #[arg(long, default_value = DEFAULTS.min_mem)]
-    min_mem: String,
-
-    #[arg(long, default_value = DEFAULTS.min_swap)]
-    min_swap: String,
+    /// The `--min-mem` that the shims pass; without it, `oomwrap run` decides
+    #[arg(long)]
+    min_mem: Option<String>,
 
     #[arg(long)]
     force: bool,
@@ -124,11 +128,9 @@ struct UninstallShimsArgs {
 struct WrapArgs {
     path: PathBuf,
 
-    #[arg(long, default_value = DEFAULTS.min_mem)]
-    min_mem: String,
-
-    #[arg(long, default_value = DEFAULTS.min_swap)]
-    min_swap: String,
+    /// The `--min-mem` that the wrapper passes; without it, `oomwrap run` decides
+    #[arg(long)]
+    min_mem: Option<String>,
 
     #[arg(long)]
     force: bool,
@@ -162,8 +164,7 @@ fn dispatch(command: Commands, host: &Host) -> Result<i32> {
         Commands::InstallShims(args) => {
             let bin_dir = bin_dir_or_default(args.bin_dir, host)?;
             let floors = ScriptFloors {
-                min_mem: &args.min_mem,
-                min_swap: &args.min_swap,
+                min_mem: args.min_mem.as_deref(),
             };
             shims::install_shims(&bin_dir, &args.tools, &floors, args.force).map(|()| 0)
         }
@@ -173,8 +174,7 @@ fn dispatch(command: Commands, host: &Host) -> Result<i32> {
         }
         Commands::Wrap(args) => {
             let floors = ScriptFloors {
-                min_mem: &args.min_mem,
-                min_swap: &args.min_swap,
+                min_mem: args.min_mem.as_deref(),
             };
             shims::wrap(&args.path, &floors, args.force).map(|()| 0)
         }
@@ -186,22 +186,32 @@ fn run_guard(args: RunArgs, host: &Host) -> Result<i32> {
     if args.use_systemd_scope || args.memory_high.is_some() || args.memory_max.is_some() {
         bail!("systemd scope support is planned but not implemented in this release");
     }
-    let earlyoom = if args.require_earlyoom {
-        EarlyoomRequirement::Required
-    } else if args.allow_no_earlyoom {
-        EarlyoomRequirement::NotRequired
+    let machine_guard = if args.require_machine_guard {
+        MachineGuardRequirement::Required
+    } else if args.allow_no_machine_guard {
+        MachineGuardRequirement::NotRequired
     } else {
-        EarlyoomRequirement::ProfileDefault
+        MachineGuardRequirement::ProfileDefault
+    };
+    let defaults = GuardPolicy::default();
+    let policy = GuardPolicy {
+        min_mem: args.min_mem.map_or(defaults.min_mem, SizeSetting::Given),
+        job_pressure: defaults.job_pressure,
+        domain_pressure: PressureLimit {
+            at_least: args
+                .domain_pressure
+                .unwrap_or(defaults.domain_pressure.at_least),
+            lasting: args
+                .domain_pressure_for
+                .unwrap_or(defaults.domain_pressure.lasting),
+        },
     };
     let options = RunOptions {
         profile: args.profile,
-        floors: Floors {
-            mem_available: args.min_mem,
-            swap_free: args.min_swap,
-        },
+        policy,
         poll: args.poll,
         term_grace: args.term_grace,
-        earlyoom,
+        machine_guard,
         event_log: args.event_log,
         command: args.command,
     };
@@ -258,5 +268,17 @@ mod tests {
     fn help_is_not_a_failure() {
         let error = Cli::try_parse_from(["oomwrap", "--help"]).unwrap_err();
         assert_eq!(error.exit_code(), 0);
+    }
+
+    #[test]
+    fn the_command_takes_its_own_flags_but_an_unknown_flag_is_an_error() {
+        let cli = Cli::try_parse_from(["oomwrap", "run", "bash", "-c", "exit 5"]).unwrap();
+        let Commands::Run(args) = cli.command else {
+            panic!("not a run command");
+        };
+        assert_eq!(args.command, ["bash", "-c", "exit 5"]);
+        let error =
+            Cli::try_parse_from(["oomwrap", "run", "--min-swap", "0", "--", "true"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
 }
