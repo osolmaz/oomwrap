@@ -23,12 +23,6 @@ Install oomwrap from crates.io:
 cargo install oomwrap --locked
 ```
 
-Install the latest `main` branch from GitHub:
-
-```bash
-cargo install --git https://github.com/osolmaz/oomwrap --locked
-```
-
 For development from a local checkout:
 
 ```bash

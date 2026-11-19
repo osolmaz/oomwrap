@@ -257,6 +257,64 @@ fn run_allows_child_to_read_from_controlling_tty() {
     }
 }
 
+/// Runs `shell_command` with bash on a fresh pseudo-terminal, writes `input`
+/// to it, and returns the output, or `None` when `script` is not installed.
+fn run_on_pty(shell_command: &str, input: &[u8]) -> Option<std::process::Output> {
+    let available = Command::new("script")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !available {
+        return None;
+    }
+    let wrapped = format!("bash -c {}", sh_quote(shell_command));
+    let mut child = Command::new("script")
+        .args(["-qfec", &wrapped, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(input).unwrap();
+    drop(child.stdin.take());
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(5) {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "timed out on the pseudo-terminal\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Some(child.wait_with_output().unwrap())
+}
+
+#[test]
+fn run_returns_the_terminal_to_the_caller() {
+    let bin = Command::cargo_bin("oomwrap")
+        .unwrap()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    // When oomwrap keeps the terminal, the shell's read stops on SIGTTIN.
+    let shell_command = format!(
+        "{} run --profile generic --min-mem 1M --min-swap 0 --allow-no-earlyoom -- sleep 0.2; read x; echo after:$x",
+        sh_quote(&bin)
+    );
+    let Some(output) = run_on_pty(&shell_command, b"from-tty\n") else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("after:from-tty"), "stdout:\n{stdout}");
+}
+
 #[test]
 fn high_risk_profiles_require_earlyoom_unless_overridden() {
     let mut present = Command::cargo_bin("oomwrap").unwrap();
@@ -735,6 +793,43 @@ fn run_cleans_background_group_after_leader_exits() {
         .parse()
         .unwrap();
     wait_for_process_exit(background_pid);
+}
+
+#[test]
+fn run_logs_group_cleanup_only_when_members_remain() {
+    let dir = tempdir().unwrap();
+    for (script, members_remain) in [
+        ("sleep 30 >/dev/null 2>&1 & exit 0", true),
+        ("exit 0", false),
+    ] {
+        let event_log = dir.path().join(format!("{members_remain}.jsonl"));
+        let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+        cmd.args([
+            "run",
+            "--profile",
+            "generic",
+            "--min-mem",
+            "1M",
+            "--min-swap",
+            "0",
+            "--term-grace",
+            "100ms",
+            "--allow-no-earlyoom",
+            "--event-log",
+            event_log.to_str().unwrap(),
+            "--",
+            "bash",
+            "-c",
+            script,
+        ]);
+        cmd.assert().success();
+        let events = fs::read_to_string(&event_log).unwrap();
+        assert_eq!(
+            events.contains("process_group_cleanup"),
+            members_remain,
+            "{events}"
+        );
+    }
 }
 
 #[test]
