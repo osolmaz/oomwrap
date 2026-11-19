@@ -6,7 +6,9 @@ job together, and records why. oomwrap stops the job early on memory pressure, w
 the kernel's pressure measure (PSI), and no longer on free swap. Every default is a share of the
 machine's RAM, so one configuration fits a laptop and a large server. Where no cgroup can be made,
 oomwrap falls back to the current polling guard with the same policy. The change is a hard cutover:
-`--min-swap` and `--use-systemd-scope` go away.
+`--min-swap` and `--use-systemd-scope` go away. After 0.2.0, all guarded jobs share one kernel
+budget, wait for room instead of failing, and react to kernel events instead of polling
+([The end state](#the-end-state)).
 
 ## Why
 
@@ -136,6 +138,18 @@ backend that `auto` would take and why, the resolved limits, and `earlyoom` with
 threshold is not below `--min-mem`. It also finds shims and wrappers that an earlier version made,
 which pass flags that 0.2.0 no longer has, and names the command that writes them again.
 
+### Configuration
+
+Every call site passes its own floors today, so one machine's policy is copied into each script,
+shim and wrapper. 0.2.0 reads one policy file: `/etc/oomwrap.toml`, then
+`~/.config/oomwrap/config.toml`, each with a section for each profile. Flags override the file. A
+value missing in all of them takes the defaults above. `doctor` prints the merged policy and the
+file that set each value.
+
+Shims and wrappers carry no policy. Both are made by one generator and end in
+`exec oomwrap run --shim <tool> -- "$real" "$@"`, so a later change of flags or defaults never
+breaks an installed shim.
+
 ### Code structure
 
 `src/lib.rs` (1,851 lines) splits by job, so that the guard core keeps no CLI, shim or file
@@ -144,21 +158,35 @@ system code (`AGENTS.md`):
 | Module | Holds | IO |
 | --- | --- | --- |
 | `limits` | `Size` (bytes or share of `MemTotal`), resolution and validation | none |
-| `readings` | Parsers of `meminfo`, PSI, `memory.events`, `memory.current`; readers with injectable roots | file reads only |
+| `readings` | Parsers of `meminfo`, PSI, `memory.events`, `memory.current` | none |
+| `host` | `Host`: the proc root, the cgroup root and the `earlyoom` check, built once at the border; tests build a fake one | file reads |
 | `policy` | `Decision::evaluate(&Limits, &Readings, &mut PressureWindow)` and `StopReason` | none |
 | `backend` | `enum Backend { Cgroup(Scope), Poll(ProcessGroup) }`: launch, readings source, stop sequence | process and cgroup |
-| `supervise` | The loop: signals, terminal foreground, events | yes |
-| `shims`, `events`, `profiles`, `doctor`, `cli` | Today's code, moved | as today |
+| `supervise` | The loop: signals, terminal foreground, events, and one `stop(StopReason)` path | yes |
+| `config` | The policy file, its merge with flags, and the profile table | file reads |
+| `shims`, `events`, `doctor`, `cli` | Today's code, moved | as today |
 
 `Backend` is an enum, not a trait object: the set is closed at two.
+
+Smells of 0.1.0 that the split removes:
+
+| Smell (place in 0.1.0) | Change |
+| --- | --- |
+| The child-exit block is copied twice in `run_guard`, and `kill_for_pressure`, `kill_for_parent_signal` and `cleanup_child_after_error` are near copies | One `stop(StopReason)` path; the loop returns one `Outcome` |
+| Event names and labels are strings (`Event`), and exit codes are bare integers in five places | `enum EventKind`, and `enum Outcome` with one `exit_code()` |
+| Sizes and durations stay `String` in the argument structs and are parsed inside `run_guard` | clap value parsers give `Size` and `Duration` at the border |
+| Engine names sit in two separate lists (`detect_profile`, `known_high_memory_processes`) | One profile table: executables, Python modules and default policy |
+| Test seams are environment variables read deep in the code (`OOMWRAP_MEMINFO_PATH`, `OOMWRAP_EARLYOOM_ACTIVE`) | One `Host` value passed in; the variables are read once, at the border |
+| `parse_size` reads `GB` as GiB and computes through `f64` | Binary units `K`, `M`, `G` and `T` only, as systemd reads them, whole numbers or a percentage; `GB` is refused |
+| Two near-copy bash generators bake the flags into every shim and wrapper | One generator, no policy in the script (above) |
 
 ## Tests
 
 - **Unit:** `Size` resolution and its bounds; the PSI and `memory.events` parsers; one table test per
   `StopReason`; the pressure window, which must not stop on one high reading; and the regression
   test of the false stop: full swap, available RAM, no pressure, no stop.
-- **Integration, in CI:** `OOMWRAP_PROC_ROOT` and `OOMWRAP_CGROUP_ROOT` point at fake trees, as
-  `OOMWRAP_MEMINFO_PATH` does today. The test changes the fake pressure and event files while a
+- **Integration, in CI:** `OOMWRAP_PROC_ROOT` and `OOMWRAP_CGROUP_ROOT`, read once into `Host`,
+  point at fake trees; they replace `OOMWRAP_MEMINFO_PATH`. The test changes the fake pressure and event files while a
   bounded child runs, and checks the reason and exit 137. The `poll` backend runs for real.
 - **Real system, ignored by default** (`cargo test -- --ignored`, on a machine with a user systemd
   manager, never in CI): a helper binary under `tests/` that
@@ -173,21 +201,50 @@ system code (`AGENTS.md`):
 
 Each phase is one pull request that passes the checks of `AGENTS.md`.
 
-1. **Split `lib.rs`** into the modules above. No change of behavior; the 51 existing tests pass
-   unchanged.
-2. **Limits, readings and policy.** `Size` with shares, the PSI parser, the policy and its tests.
-   The `poll` backend moves to the new policy: no swap floor, machine pressure, shares of
-   `MemTotal`. CLI cutover: `--min-swap` goes.
+1. **Split `lib.rs`** into the modules above, with `Host`, the profile table, `EventKind`,
+   `Outcome`, one `stop` path and typed `Size` and `Duration` arguments. No change of behavior; the
+   51 existing tests pass unchanged.
+2. **Limits, readings and policy.** `Size` with shares and binary units only, the PSI parser, the
+   policy and its tests. The `poll` backend moves to the new policy: no swap floor, machine
+   pressure, shares of `MemTotal`. CLI cutover: `--min-swap` goes.
 3. **The `cgroup` backend:** scope launch, cgroup lookup and read-back, readings, stop sequence,
    `kernel_oom_kill`, `--backend`, nested runs, events. `--use-systemd-scope` goes; `--memory-max`
    and `--memory-high` get their meaning.
-4. **`doctor`, `inspect`, shims and wrappers:** the capability report, the resolved limits, new
-   shim and wrapper scripts (`OOMWRAP_MEMORY_MAX` and the others replace `OOMWRAP_MIN_SWAP`), and
-   the finding of old ones.
+4. **Configuration, `doctor`, `inspect`, shims and wrappers:** the policy file, the capability
+   report, the resolved limits, the one generator of shims and wrappers without policy, and the
+   finding of old ones.
 5. **Real-system suite and calibration:** the ignored tests, then recorded runs of a build, a
    renderer and a model load, to set the PSI defaults. The results go into this document.
 6. **Documents and release:** `README.md`, `implementation-plan.md` (its design section is replaced),
    the `memory-safe-launch` skill, `CHANGELOG.md`, version 0.2.0.
+
+## The end state
+
+0.2.0 guards one job well. The end state guards the machine's whole set of heavy jobs: each job
+holds a memory contract that the kernel enforces, against one machine policy, with nothing to tune
+per machine and every outcome explained. Each step below is its own release after 0.2.0.
+
+7. **One shared budget.** Every guarded scope starts under one systemd slice, `oomwrap.slice`, with
+   its own `MemoryMax` and `MemoryHigh` from the policy file. The kernel then enforces the total of
+   all guarded jobs together, also of jobs that different users or scripts start.
+8. **Wait for room instead of refusing.** A job may declare its need (`--expect 12G`, or a profile
+   default). With `--wait-for-room`, a job whose need does not fit the slice and the machine waits,
+   in order of arrival, until it fits, instead of failing at preflight (exit 4). This replaces
+   hand-made queues that cap heavy jobs at a fixed count of slots. `oomwrap status` lists the jobs
+   in the slice and the ones that wait.
+9. **Event-driven supervision.** One `poll()` loop on the child's `pidfd`, a `signalfd`, PSI
+   triggers (the kernel wakes oomwrap when pressure passes a limit within a window, where it lets
+   an unprivileged user register one; elsewhere oomwrap reads `avg10` as before), `cgroup.events`
+   (the job is empty) and `memory.events` (the kernel killed). No poll interval to tune, and a
+   reaction within milliseconds of the kernel's signal.
+10. **Slow down before stopping.** `memory.high` already throttles a job before its hard limit.
+    With `--on-pressure freeze`, a batch job is frozen (`cgroup.freeze`) while the machine is under
+    pressure, and thawed when the pressure ends; it is stopped only when the pressure lasts longer
+    than `--freeze-for`. A frozen job keeps its memory, so this helps only with another job's
+    short peak.
+11. **A stable event schema.** The JSON event log gets a version field, a documented schema and an
+    `oomwrap explain` command that turns a log into the story of each stop: reason, readings and
+    limits.
 
 ## Risks and open questions
 
