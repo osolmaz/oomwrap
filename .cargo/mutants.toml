@@ -1,0 +1,17 @@
+# cargo-mutants settings.
+#
+# Never mutate code that chooses which process receives a signal. A mutant
+# there can turn a target into 0, 1 or -1, or into the wrong set of processes,
+# and kill(2) then signals the caller's own process group or every process of
+# the user who runs the tests. One mutant of process_group_member_pids that
+# returned [-1] did exactly that. These functions are covered by unit tests and
+# by the integration suite instead. Run mutation tests of the rest on CI.
+exclude_globs = ["src/signal.rs"]
+exclude_re = [
+    "ProcessId",
+    "signal_process_group",
+    "process_group_member_pids",
+    "process_group_id",
+    "process_group_exists",
+    "terminate_process_group",
+]

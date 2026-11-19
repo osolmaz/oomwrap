@@ -1,0 +1,7 @@
+# Every signal goes through src/signal.rs, whose ProcessId refuses 0, 1 and
+# negative IDs. kill(-1) signals every process of the user, and killpg(1) is the
+# same call.
+disallowed-methods = [
+    { path = "nix::sys::signal::kill", reason = "send signals through src/signal.rs" },
+    { path = "nix::sys::signal::killpg", reason = "send signals through src/signal.rs" },
+]

@@ -16,13 +16,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nix::errno::Errno;
-use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
+use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 use nix::sys::statvfs::statvfs;
 use nix::unistd::{Pid, getpgrp, tcgetpgrp, tcsetpgrp};
 use serde::{Deserialize, Serialize};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
+mod signal;
 mod skills;
+
+use signal::{ProcessId, group_exists, signal_group, signal_process};
 
 const DEFAULT_TOOLS: &[&str] = &[
     "vllm",
@@ -340,7 +343,12 @@ fn run_guard(args: RunArgs) -> Result<i32> {
 
     let shutdown_signal = shutdown_signal_flag()?;
     let mut child = spawn_process_group(&args.command)?;
-    let pgid = child.id() as i32;
+    let Some(pgid) = ProcessId::from_child_id(child.id()) else {
+        bail!(
+            "child process ID {} cannot be signaled; the child runs unguarded",
+            child.id()
+        );
+    };
     let mut terminal = match TerminalForeground::handoff_to_child(pgid) {
         Ok(terminal) => terminal,
         Err(error) => return cleanup_child_after_error(&mut child, pgid, term_grace, None, error),
@@ -486,7 +494,7 @@ fn run_guard(args: RunArgs) -> Result<i32> {
 
 fn kill_for_pressure(
     child: &mut Child,
-    pgid: i32,
+    pgid: ProcessId,
     term_grace: Duration,
     terminal: &mut Option<TerminalForeground>,
     logger: &mut EventLogger,
@@ -518,7 +526,7 @@ struct PressureReason<'a> {
 
 fn kill_for_parent_signal(
     child: &mut Child,
-    pgid: i32,
+    pgid: ProcessId,
     term_grace: Duration,
     terminal: &mut Option<TerminalForeground>,
     logger: &mut EventLogger,
@@ -541,7 +549,7 @@ fn kill_for_parent_signal(
 
 fn cleanup_child_after_error(
     child: &mut Child,
-    pgid: i32,
+    pgid: ProcessId,
     term_grace: Duration,
     mut terminal: Option<TerminalForeground>,
     error: anyhow::Error,
@@ -673,7 +681,7 @@ struct TerminalForeground {
 }
 
 impl TerminalForeground {
-    fn handoff_to_child(pgid: i32) -> Result<Option<Self>> {
+    fn handoff_to_child(pgid: ProcessId) -> Result<Option<Self>> {
         let tty = match OpenOptions::new().read(true).write(true).open("/dev/tty") {
             Ok(tty) => tty,
             Err(_) => return Ok(None),
@@ -687,7 +695,7 @@ impl TerminalForeground {
             return Ok(None);
         }
 
-        let child_pgrp = Pid::from_raw(pgid);
+        let child_pgrp = pgid.as_pid();
         if original_pgrp == child_pgrp {
             return Ok(None);
         }
@@ -802,7 +810,7 @@ fn sleep_until_poll_signal_or_child(
 // The integration suite covers TERM/KILL behavior with real child processes.
 // Sub-millisecond deadline boundary mutations here are noisy for cargo-mutants.
 #[cfg_attr(test, mutants::skip)]
-fn terminate_process_group(child: &mut Child, pgid: i32, term_grace: Duration) -> Result<()> {
+fn terminate_process_group(child: &mut Child, pgid: ProcessId, term_grace: Duration) -> Result<()> {
     let _ = signal_process_group(pgid, Signal::SIGTERM);
     let started = Instant::now();
     let mut seen_group = false;
@@ -853,8 +861,8 @@ fn terminate_process_group(child: &mut Child, pgid: i32, term_grace: Duration) -
 
 // Thin /proc adapter; exercised through process-group integration tests.
 #[cfg_attr(test, mutants::skip)]
-fn process_group_exists(pgid: i32) -> bool {
-    match kill(Pid::from_raw(-pgid), None) {
+fn process_group_exists(pgid: ProcessId) -> bool {
+    match group_exists(pgid) {
         Ok(()) => return true,
         Err(Errno::ESRCH) => {}
         Err(_) => return true,
@@ -864,8 +872,10 @@ fn process_group_exists(pgid: i32) -> bool {
         .unwrap_or(false)
 }
 
-fn signal_process_group(pgid: i32, signal: Signal) -> nix::Result<()> {
-    let group_result = kill(Pid::from_raw(-pgid), signal);
+// Chooses signal targets; `.cargo/mutants.toml` keeps cargo-mutants out of it.
+#[cfg_attr(test, mutants::skip)]
+fn signal_process_group(pgid: ProcessId, signal: Signal) -> nix::Result<()> {
+    let group_result = signal_group(pgid, signal);
     if group_result.is_ok() {
         return Ok(());
     }
@@ -873,7 +883,7 @@ fn signal_process_group(pgid: i32, signal: Signal) -> nix::Result<()> {
     let mut signaled_member = false;
     if let Ok(pids) = process_group_member_pids(pgid) {
         for pid in pids {
-            if kill(Pid::from_raw(pid), signal).is_ok() {
+            if signal_process(pid, signal).is_ok() {
                 signaled_member = true;
             }
         }
@@ -885,18 +895,17 @@ fn signal_process_group(pgid: i32, signal: Signal) -> nix::Result<()> {
     }
 }
 
-fn process_group_member_pids(pgid: i32) -> Result<Vec<i32>> {
+// Chooses signal targets; `.cargo/mutants.toml` keeps cargo-mutants out of it.
+#[cfg_attr(test, mutants::skip)]
+fn process_group_member_pids(pgid: ProcessId) -> Result<Vec<ProcessId>> {
     let mut pids = Vec::new();
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
-        let file_name = entry.file_name();
-        let Some(pid_str) = file_name.to_str() else {
+        // An entry name that is not a process ID above 1 never becomes a target.
+        let Some(pid) = entry.file_name().to_str().and_then(ProcessId::parse) else {
             continue;
         };
-        let Ok(pid) = pid_str.parse::<i32>() else {
-            continue;
-        };
-        if read_process_group_id(&entry.path()).ok() == Some(pgid) {
+        if read_process_group_id(&entry.path()).ok() == Some(pgid.as_raw()) {
             pids.push(pid);
         }
     }
@@ -1847,5 +1856,20 @@ SwapFree:          789 kB
             real_path_for(Path::new("/tmp/vllm")),
             PathBuf::from("/tmp/vllm.real")
         );
+    }
+
+    #[test]
+    fn process_group_members_are_only_the_own_child() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = ProcessId::from_child_id(child.id()).unwrap();
+        let members = process_group_member_pids(pgid).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(members, vec![pgid]);
+        assert!(!process_group_exists(pgid));
     }
 }
