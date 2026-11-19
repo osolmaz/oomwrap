@@ -339,7 +339,8 @@ system code (`AGENTS.md`):
 | Module | Holds | IO |
 | --- | --- | --- |
 | `limits` | `Size` (bytes, share or `infinity`, with bounds), resolution against the domain, validation | none |
-| `readings` | Parsers of `meminfo`, PSI, `memory.events`, `memory.stat`, `memory.current`, `mountinfo` | none |
+| `readings` | Parsers of `meminfo`, PSI, `memory.events`, `memory.stat`, `memory.current`, `mountinfo` and the process group field of `/proc/<pid>/stat` | none |
+| `signal` | `ProcessId`, which holds only IDs greater than 1, and the only calls of `kill` and `killpg` | signals |
 | `host` | `Host`: the proc root, the cgroup root, the `systemd-run` program, the page size and the machine-guard check, built once at the border; tests build a fake one | file reads |
 | `domain` | Finding the memory domain and the caller's limits | file reads |
 | `policy` | `Decision::evaluate(&Limits, &Readings, &mut PressureWindow)` and `StopReason` | none |
@@ -350,6 +351,12 @@ system code (`AGENTS.md`):
 | `shims`, `events`, `doctor`, `cli` | The code of 0.1.0, moved | as today |
 
 `Backend` is an enum, not a trait object: the set is closed at two.
+
+kill(2) reads 0 as the caller's own process group and -1 as every process of the user, and
+killpg(1) is kill(-1). A mutation test once turned a member list into `[-1]` and ended every
+process of the user who ran it. So every signal takes a `ProcessId`, `clippy.toml` forbids `kill`
+and `killpg` outside `signal`, and `.cargo/mutants.toml` keeps cargo-mutants out of the functions
+that choose signal targets. This change came first, before phase 1, as its own pull request.
 
 Smells of 0.1.0 that the split removes:
 
@@ -409,19 +416,29 @@ Smells of 0.1.0 that the split removes:
 Code that only the real-system suite can reach stays in thin adapters with a written reason for the
 mutation-test skip, as 0.1.0 does today.
 
+Mutation tests never run on a workstation over code that sends signals, kills processes, writes
+`cgroup.kill` or calls `systemd-run`: a mutant there can reach processes that the tests did not
+start. They run on CI, on a throwaway runner (`workflow_dispatch` of the CI workflow). Locally,
+only pure modules are mutated, file by file. A test signals only processes that it started, and
+creates and removes only its own `oomwrap-` scopes.
+
 ## Phases
 
 Each phase is one pull request that passes the checks of `AGENTS.md`, and the main branch holds a
 working tool after every phase. Users install the released crate, never the main branch: phase 1
 changes the install command of the `memory-safe-launch` skill from the Git main branch to
-`cargo install oomwrap --locked`, as the README already does first. The skill and the README keep
+`cargo install oomwrap --locked`, as the README already does first, and drops the README's
+instruction to install the main branch. The skill and the README keep
 describing the released version until phase 7 changes them together with the release, so no agent
 reads 0.2.0 flags while it runs 0.1.0, or the reverse.
 
 1. **Split `lib.rs`** into the modules above, with `Host`, the profile table, `EventKind`,
    `Outcome`, one `stop` path and typed `Size` and `Duration` arguments. `Size` keeps the parsing
-   rules of 0.1.0 until phase 2. No change of behavior; the 51 existing tests pass unchanged. The
-   skill's install command changes as above.
+   rules of 0.1.0 until phase 2. No change of behavior: the 41 integration tests pass unchanged,
+   and the 10 unit tests move, with the same assertions, into the modules of the code they test.
+   The flags of `install-shims` and `wrap` stay text until phase 5, because the scripts quote them
+   as data and a test checks that a hostile value stays inert. The skill's install command changes
+   as above.
 2. **Policy core.** The memory domain, `Size` with shares, bounds and `infinity`, the parsers, the
    policy and its tests. The `poll` backend moves to the new policy: no swap floor, domain pressure
    and floor, shares of the domain. The machine-wide guard check. The exit-code table. CLI cutover:

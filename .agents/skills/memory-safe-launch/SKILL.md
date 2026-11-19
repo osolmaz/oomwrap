@@ -66,7 +66,7 @@ Linux-only, and macOS does not use `earlyoom`.
 If oomwrap is absent, install it only when installation is authorized:
 
 ```bash
-cargo install --git https://github.com/osolmaz/oomwrap --locked
+cargo install oomwrap --locked
 ```
 
 Verify installation with `oomwrap inspect`.
