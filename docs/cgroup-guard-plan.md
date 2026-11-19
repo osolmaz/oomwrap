@@ -51,14 +51,21 @@ systemd-run --user --scope --quiet --collect \
   --unit oomwrap-<profile>-<pid>-<random> \
   -p MemoryMax=<bytes> -p MemoryHigh=<bytes> -p MemorySwapMax=<bytes> \
   -p OOMPolicy=kill \
-  -- <command> [args...]
+  -- <oomwrap> exec-job --oom-score-adj 1000 -- <command> [args...]
 ```
 
 oomwrap spawns `systemd-run` in a new process group, as it spawns the command today, so terminal
 foreground control and signal forwarding stay as they are. `systemd-run --scope` creates the scope
-with its own PID and then executes the command in that same process, so no process of the job ever
-runs outside the cgroup. `OOMPolicy=kill` sets `memory.oom.group`, so a kernel kill at `MemoryMax`
-ends the whole job at once.
+with its own PID and then executes the next program in that same process, so no process of the job
+ever runs outside the cgroup. `OOMPolicy=kill` sets `memory.oom.group`, so a kernel kill at
+`MemoryMax` ends the whole job at once.
+
+**The job is the first victim.** `exec-job` is a hidden subcommand of oomwrap itself. It writes
+`1000` to `/proc/self/oom_score_adj` and then executes the command in the same process, so every
+process of the job inherits the score. A normal user may raise its own score, and safe Rust does
+both steps. The kernel's out-of-memory killer and `earlyoom` choose their victim by this score, so a
+machine-wide kill takes the guarded job before an editor, a browser or an agent session. The `poll`
+backend starts the job through `exec-job` too.
 
 After the start, oomwrap:
 
@@ -71,8 +78,8 @@ After the start, oomwrap:
 Rejected alternatives:
 
 - **D-Bus `StartTransientUnit` through `zbus`.** It is the API under `systemd-run`, but it needs a
-  large async dependency for one call, and a self-executing trampoline to keep the child out of the
-  cgroup race. `systemd-run` already does both.
+  large async dependency for one call, and its own handshake to keep the child out of the cgroup
+  race. `systemd-run` already does both.
 - **Writing `/sys/fs/cgroup` directly.** systemd owns the tree, and a terminal's scope is not
   delegated; writing there breaks systemd's single-writer rule.
 - **`cgexec` and libcgroup.** Not installed by default, and designed for cgroup v1.
@@ -114,6 +121,21 @@ has no PSI, the pressure conditions are off and `doctor` says so.
 
 Preflight refuses a launch (exit 4) when `ram_floor` or `machine_pressure` already holds.
 
+Memory that a device driver allocates for the job can sit outside these readings. On a machine with
+unified GPU memory, where the GPU has no memory of its own, a model's GPU allocations come from
+system RAM, and the memory controller may not charge them to the job's cgroup. `machine_pressure`
+and `ram_floor` still see that memory. Phase 5 measures whether the cgroup charges it, and step 12
+of [The end state](#the-end-state) counts it in the job's limit.
+
+### Machine-wide guard
+
+oomwrap guards one job; a machine-wide guard stays the fallback for everything else. The inference
+profiles require one: `earlyoom` or `systemd-oomd`, whichever is active. `--require-machine-guard`
+and `--allow-no-machine-guard` replace `--require-earlyoom` and `--allow-no-earlyoom`, and a missing
+required guard keeps exit 3. oomwrap never depends on `systemd-oomd` for its own decisions, because
+many machines do not install it. When both guards are active, `doctor` warns that two tools may kill
+for the same pressure.
+
 ### Stop sequence
 
 `cgroup`: send `SIGTERM` to every PID in `cgroup.procs`, wait `--term-grace`, write `1` to
@@ -134,9 +156,10 @@ decided it: PSI values, `memory.current` and the `memory.events` counters.
 ### doctor and inspect
 
 `doctor` reports cgroup v2, the user manager, the delegated controllers, PSI for the machine, the
-backend that `auto` would take and why, the resolved limits, and `earlyoom` with a warning when its
-threshold is not below `--min-mem`. It also finds shims and wrappers that an earlier version made,
-which pass flags that 0.2.0 no longer has, and names the command that writes them again.
+backend that `auto` would take and why, the resolved limits, and the machine-wide guards: which of
+`earlyoom` and `systemd-oomd` are active, a warning when `earlyoom`'s threshold is not below
+`--min-mem`, and a warning when both run. It also finds shims and wrappers that an earlier version
+made, which pass flags that 0.2.0 no longer has, and names the command that writes them again.
 
 ### Configuration
 
@@ -186,8 +209,15 @@ Smells of 0.1.0 that the split removes:
   `StopReason`; the pressure window, which must not stop on one high reading; and the regression
   test of the false stop: full swap, available RAM, no pressure, no stop.
 - **Integration, in CI:** `OOMWRAP_PROC_ROOT` and `OOMWRAP_CGROUP_ROOT`, read once into `Host`,
-  point at fake trees; they replace `OOMWRAP_MEMINFO_PATH`. The test changes the fake pressure and event files while a
-  bounded child runs, and checks the reason and exit 137. The `poll` backend runs for real.
+  point at fake trees; they replace `OOMWRAP_MEMINFO_PATH`. The test changes the fake pressure and
+  event files while a bounded child runs, and checks the reason and exit 137. The `poll` backend
+  runs for real. A test reads `/proc/<child>/oom_score_adj` and expects `1000`.
+- **Replay of recorded runs, in CI:** phase 5 records real runs as traces: one `Readings` value
+  each second, with a generic job label (`build`, `renderer`, `model load`) and no command line,
+  host name or path. The traces are stored under `tests/fixtures/traces/` with the decision that
+  each run must get: a healthy run never stops, a run that froze the machine stops before the
+  freeze. CI replays every trace through `policy`, so each change of the policy or of a default is
+  checked against real history and not only against made-up numbers.
 - **Real system, ignored by default** (`cargo test -- --ignored`, on a machine with a user systemd
   manager, never in CI): a helper binary under `tests/` that
   - allocates past a `64M` `--memory-max`: `kernel_oom_kill`, exit 137, no process left;
@@ -206,17 +236,24 @@ Each phase is one pull request that passes the checks of `AGENTS.md`.
    51 existing tests pass unchanged.
 2. **Limits, readings and policy.** `Size` with shares and binary units only, the PSI parser, the
    policy and its tests. The `poll` backend moves to the new policy: no swap floor, machine
-   pressure, shares of `MemTotal`. CLI cutover: `--min-swap` goes.
+   pressure, shares of `MemTotal`. `exec-job` and the score of `1000`. The machine-wide guard
+   check accepts `earlyoom` or `systemd-oomd`. CLI cutover: `--min-swap`, `--require-earlyoom` and
+   `--allow-no-earlyoom` go.
 3. **The `cgroup` backend:** scope launch, cgroup lookup and read-back, readings, stop sequence,
    `kernel_oom_kill`, `--backend`, nested runs, events. `--use-systemd-scope` goes; `--memory-max`
    and `--memory-high` get their meaning.
 4. **Configuration, `doctor`, `inspect`, shims and wrappers:** the policy file, the capability
    report, the resolved limits, the one generator of shims and wrappers without policy, and the
    finding of old ones.
-5. **Real-system suite and calibration:** the ignored tests, then recorded runs of a build, a
-   renderer and a model load, to set the PSI defaults. The results go into this document.
+5. **Real-system suite, traces and calibration:** the ignored tests; recorded runs of a build, a
+   renderer and a model load, stored as replay traces; the PSI defaults set from them; and a model
+   load on a machine with unified GPU memory, to measure whether the cgroup charges the GPU's
+   allocations. The results go into this document.
 6. **Documents and release:** `README.md`, `implementation-plan.md` (its design section is replaced),
-   the `memory-safe-launch` skill, `CHANGELOG.md`, version 0.2.0.
+   the `memory-safe-launch` skill, `CHANGELOG.md`, version 0.2.0. The release workflow also builds
+   static binaries (`x86_64` and `aarch64`, musl) and attaches them to the GitHub release with
+   SHA-256 checksums and build provenance attestations, so a machine without a Rust toolchain can
+   install oomwrap. `cargo install` stays.
 
 ## The end state
 
@@ -231,7 +268,9 @@ per machine and every outcome explained. Each step below is its own release afte
    default). With `--wait-for-room`, a job whose need does not fit the slice and the machine waits,
    in order of arrival, until it fits, instead of failing at preflight (exit 4). This replaces
    hand-made queues that cap heavy jobs at a fixed count of slots. `oomwrap status` lists the jobs
-   in the slice and the ones that wait.
+   in the slice and the ones that wait. `oomwrap status --json` gives the budget, its use, the free
+   room and the queue in a stable form, so a script or an agent can plan a launch before it starts
+   one, instead of learning the limits from a refusal.
 9. **Event-driven supervision.** One `poll()` loop on the child's `pidfd`, a `signalfd`, PSI
    triggers (the kernel wakes oomwrap when pressure passes a limit within a window, where it lets
    an unprivileged user register one; elsewhere oomwrap reads `avg10` as before), `cgroup.events`
@@ -245,12 +284,30 @@ per machine and every outcome explained. Each step below is its own release afte
 11. **A stable event schema.** The JSON event log gets a version field, a documented schema and an
     `oomwrap explain` command that turns a log into the story of each stop: reason, readings and
     limits.
+12. **Count device memory in the job.** When phase 5 shows that the cgroup does not charge a GPU's
+    allocations from system RAM, oomwrap reads the job's GPU memory through the vendor's management
+    library (NVML for NVIDIA, loaded at run time only when present) for every PID in
+    `cgroup.procs`. It adds that memory to `memory.current` in `Readings`, and a new reason,
+    `device_memory`, stops the job when the sum passes `--memory-max`. The kernel cannot enforce
+    this part, so oomwrap does, at its reading interval.
+
+What stays out:
+
+- **Handing pressure stops to `systemd-oomd`.** Many machines do not install it, and oomwrap must
+  work without it.
+- **A Rust library API.** It adds public surface to keep stable, and a process cannot easily move
+  itself into a new cgroup; the command line is the contract.
+- **macOS.** It has no cgroups and no PSI. macOS stays out of scope, as in 0.1.0.
 
 ## Risks and open questions
 
 - **Memory outside the cgroup's count.** A device driver can allocate memory for the job that the
   memory controller does not charge, for example unified GPU memory. `machine_pressure` and
-  `ram_floor` stay for that reason; phase 5 checks a model load on such a machine.
+  `ram_floor` stay for that reason; phase 5 checks a model load on such a machine, and step 12
+  counts that memory in the job.
+- **A job that lowers its own score.** An unprivileged process can lower its `oom_score_adj` again,
+  down to the lowest value a privileged process set for it. A job that does so is no longer the
+  first victim of a machine-wide kill; its own limits still hold.
 - **No user manager.** Containers and SSH sessions without lingering have none. `auto` then uses
   `poll` and logs it.
 - **systemd version.** Phase 3 sets the lowest version that applies `MemorySwapMax`, `MemoryHigh`
