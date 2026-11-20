@@ -85,9 +85,15 @@ impl FakeMachine {
         )
     }
 
+    /// The folder of the default event log of this machine's runs.
+    fn state_home(&self) -> PathBuf {
+        self.dir.path().join("state")
+    }
+
     fn oomwrap(&self) -> Command {
         let mut cmd = Command::cargo_bin("oomwrap").unwrap();
-        cmd.env("OOMWRAP_PROC_ROOT", self.proc_root());
+        cmd.env("OOMWRAP_PROC_ROOT", self.proc_root())
+            .env("XDG_STATE_HOME", self.state_home());
         cmd
     }
 
@@ -102,8 +108,9 @@ impl FakeMachine {
     /// The same as [`Self::run`], as shell text.
     fn run_line(&self) -> String {
         format!(
-            "OOMWRAP_PROC_ROOT={} {} run --profile generic --allow-no-machine-guard",
+            "OOMWRAP_PROC_ROOT={} XDG_STATE_HOME={} {} run --profile generic --allow-no-machine-guard",
             sh_quote(&self.proc_root().display().to_string()),
+            sh_quote(&self.state_home().display().to_string()),
             sh_quote(&oomwrap_bin())
         )
     }
@@ -163,6 +170,7 @@ fn guarded_tool(tool: &Path, dirs: &[&Path], machine: &FakeMachine) -> Command {
     let mut cmd = Command::new(tool);
     cmd.env("PATH", parts.join(":"))
         .env("OOMWRAP_PROC_ROOT", machine.proc_root())
+        .env("XDG_STATE_HOME", machine.state_home())
         .env("OOMWRAP_ALLOW_NO_MACHINE_GUARD", "1");
     cmd
 }
@@ -376,6 +384,257 @@ fn run_returns_the_terminal_to_the_caller() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "stdout:\n{stdout}");
     assert!(stdout.contains("after:from-tty"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn ctrl_z_stops_the_shell_job_and_fg_resumes_it() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    // The job stops itself as on Ctrl-Z. The shell must see a stopped job,
+    // and after `fg` the job must hold the terminal again to read from it.
+    let shell_command = format!(
+        "set -m; {} -- bash -c {}; echo stopped:$?; fg; echo done:$?",
+        machine.run_line(),
+        sh_quote("kill -TSTP $$; read x; echo resumed:$x")
+    );
+    let Some(output) = run_on_pty(&shell_command, b"from-tty\n") else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stopped:148"), "stdout:\n{stdout}");
+    assert!(stdout.contains("resumed:from-tty"), "stdout:\n{stdout}");
+    assert!(stdout.contains("done:0"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn run_makes_the_job_the_first_victim_of_an_out_of_memory_kill() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let mut cmd = machine.run();
+    cmd.args(["--", "cat", "/proc/self/oom_score_adj"]);
+    cmd.assert().success().stdout("1000\n");
+}
+
+#[test]
+fn the_control_socket_never_reaches_the_command() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let mut cmd = machine.run();
+    cmd.args(["--", "bash", "-c", "ls -l /proc/$$/fd/"]);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains(" 0 -> "))
+        .stdout(predicate::str::contains("socket:").not());
+}
+
+#[test]
+fn a_guarded_command_keeps_its_own_skill_flag() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let mut cmd = machine.run();
+    cmd.args(["--", "echo", "--skill", "list"]);
+    cmd.assert().success().stdout("--skill list\n");
+}
+
+#[test]
+fn the_command_starts_once() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let starts = machine.file("starts");
+    let mut cmd = machine.run();
+    cmd.args([
+        "--",
+        "bash",
+        "-c",
+        &format!("echo start >> {}", starts.display()),
+    ]);
+    cmd.assert().success();
+    assert_eq!(fs::read_to_string(starts).unwrap(), "start\n");
+}
+
+#[test]
+fn a_command_that_cannot_run_ends_as_in_a_shell() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let event_log = machine.file("events.jsonl");
+    let mut missing = machine.run();
+    missing.args([
+        "--event-log",
+        event_log.to_str().unwrap(),
+        "--",
+        "oomwrap-test-no-such-program",
+    ]);
+    missing.assert().code(127).stderr(predicate::str::contains(
+        "cannot run oomwrap-test-no-such-program",
+    ));
+    let events = read_events(&event_log);
+    let failed = events
+        .iter()
+        .find(|event| event["event"] == "exec_failed")
+        .unwrap();
+    assert_eq!(failed["exit_code"], 127);
+    assert!(events.iter().all(|event| event["event"] != "launched"));
+
+    let not_executable = machine.file("data.txt");
+    fs::write(&not_executable, "data").unwrap();
+    let mut denied = machine.run();
+    denied.args(["--", not_executable.to_str().unwrap()]);
+    denied.assert().code(126);
+}
+
+/// The one file of the default event log of `machine`.
+fn default_log(machine: &FakeMachine) -> PathBuf {
+    let dir = machine.state_home().join("oomwrap");
+    let files: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let name = files[0].file_name().unwrap().to_str().unwrap().to_string();
+    assert!(
+        name.starts_with("events-") && name.ends_with(".jsonl"),
+        "{name}"
+    );
+    files[0].clone()
+}
+
+#[test]
+fn the_default_event_log_holds_the_program_name_only() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let mut cmd = machine.run();
+    cmd.args(["--", "bash", "-c", "exit 0", "--token=secret-value"]);
+    cmd.assert().success();
+    let log = default_log(&machine);
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(!text.contains("secret-value"), "{text}");
+    let events = read_events(&log);
+    let kinds: Vec<_> = events.iter().map(|event| event["event"].clone()).collect();
+    assert_eq!(kinds, ["preflight", "launched", "exited"]);
+    for event in &events {
+        assert_eq!(event["schema_version"], 1);
+        assert_eq!(event["backend"], "poll");
+        assert_eq!(event["program"], "bash");
+        assert!(event.get("command").is_none());
+    }
+    let launched = &events[1];
+    assert_eq!(launched["oom_score_adj"], 1000);
+    assert!(launched["limits"]["min_free_bytes"].as_u64().unwrap() > 0);
+    assert!(
+        launched["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no job limit")
+    );
+
+    let mut logged = machine.run();
+    logged.args([
+        "--log-command",
+        "--",
+        "bash",
+        "-c",
+        "exit 0",
+        "--token=secret-value",
+    ]);
+    logged.assert().success();
+    assert!(fs::read_to_string(&log).unwrap().contains("secret-value"));
+}
+
+#[test]
+fn the_event_log_can_be_turned_off_and_a_broken_default_only_warns() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let mut off = machine.run();
+    off.args(["--event-log", "none", "--", "bash", "-c", "exit 0"]);
+    off.assert().success();
+    assert!(!machine.state_home().exists());
+
+    let not_a_folder = machine.file("state-file");
+    fs::write(&not_a_folder, "").unwrap();
+    let mut broken = machine.run();
+    broken
+        .env("XDG_STATE_HOME", &not_a_folder)
+        .args(["--", "bash", "-c", "exit 0"]);
+    broken.assert().success().stderr(predicate::str::contains(
+        "running without the default event log",
+    ));
+
+    let mut explicit = machine.run();
+    explicit.args([
+        "--event-log",
+        not_a_folder.join("x.jsonl").to_str().unwrap(),
+        "--",
+        "bash",
+        "-c",
+        "exit 0",
+    ]);
+    explicit
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("failed to"));
+}
+
+#[test]
+fn concurrent_runs_never_mix_event_lines() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let event_log = machine.file("events.jsonl");
+    let long_argument = "x".repeat(16 * 1024);
+    let runs: Vec<_> = (0..8)
+        .map(|_| {
+            let mut cmd = machine.run();
+            cmd.args([
+                "--log-command",
+                "--event-log",
+                event_log.to_str().unwrap(),
+                "--",
+                "bash",
+                "-c",
+                "exit 0",
+                &long_argument,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+            cmd.spawn().unwrap()
+        })
+        .collect();
+    for mut run in runs {
+        assert!(run.wait().unwrap().success());
+    }
+    // Each line parses on its own: no write landed inside another.
+    let events = read_events(&event_log);
+    assert_eq!(events.len(), 8 * 3);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["command"][3] == long_argument.as_str())
+    );
+}
+
+#[test]
+fn record_readings_writes_each_reading_and_decision() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    machine.set_pressure("1.25");
+    let trace = machine.file("trace.jsonl");
+    let mut cmd = machine.run();
+    cmd.args([
+        "--poll",
+        "50ms",
+        "--record-readings",
+        trace.to_str().unwrap(),
+        "--",
+        "bash",
+        "-c",
+        "sleep 0.3",
+    ]);
+    cmd.assert().success();
+    let lines = read_events(&trace);
+    assert!(lines.len() >= 3, "{lines:?}");
+    for line in &lines {
+        assert_eq!(line["decision"], "continue");
+        assert_eq!(line["readings"]["domain"]["size_bytes"], MACHINE_KIB * 1024);
+        assert_eq!(line["readings"]["domain"]["full_avg10"], 1.25);
+        assert!(line["readings"]["job"].is_null());
+    }
+    let elapsed: Vec<_> = lines
+        .iter()
+        .map(|line| line["readings"]["elapsed_ms"].as_u64().unwrap())
+        .collect();
+    assert!(
+        elapsed.windows(2).all(|pair| pair[0] <= pair[1]),
+        "{elapsed:?}"
+    );
 }
 
 #[test]
@@ -628,10 +887,10 @@ fn run_stops_on_lasting_domain_pressure() {
     let events = read_events(&event_log);
     let stop = events
         .iter()
-        .find(|event| event["event"] == "memory_pressure_kill")
+        .find(|event| event["event"] == "stopped")
         .unwrap();
-    assert_eq!(stop["label"], "domain_pressure");
-    assert_eq!(stop["readings"]["full_avg10"], 55.0);
+    assert_eq!(stop["reason"], "domain_pressure");
+    assert_eq!(stop["readings"]["domain"]["full_avg10"], 55.0);
 }
 
 #[test]
@@ -699,11 +958,11 @@ fn run_kills_process_group_when_memory_drops() {
     let events = read_events(&event_log);
     let stop = events
         .iter()
-        .find(|event| event["event"] == "memory_pressure_kill")
+        .find(|event| event["event"] == "stopped")
         .unwrap();
-    assert_eq!(stop["label"], "domain_floor");
+    assert_eq!(stop["reason"], "domain_floor");
     assert_eq!(stop["domain"]["kind"], "machine");
-    assert_eq!(stop["readings"]["free_bytes"], LOW_KIB * 1024);
+    assert_eq!(stop["readings"]["domain"]["free_bytes"], LOW_KIB * 1024);
 }
 
 #[test]
@@ -868,11 +1127,7 @@ fn run_logs_group_cleanup_only_when_members_remain() {
         ]);
         cmd.assert().success();
         let events = fs::read_to_string(&event_log).unwrap();
-        assert_eq!(
-            events.contains("process_group_cleanup"),
-            members_remain,
-            "{events}"
-        );
+        assert_eq!(events.contains("\"cleanup\""), members_remain, "{events}");
     }
 }
 

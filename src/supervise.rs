@@ -1,12 +1,11 @@
-//! `oomwrap run`: preflight, launch, the watch loop, and one stop path.
+//! `oomwrap run`: preflight, the launch handshake, the watch loop, job
+//! control, and one stop path.
 
 mod terminal;
 
 use std::ffi::OsString;
 use std::io;
-use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -15,14 +14,21 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
-use crate::backend::ProcessGroup;
+use crate::backend::{BackendKind, LeaderExit, LeaderState, ProcessGroup};
 use crate::config::{Profile, effective_profile};
 use crate::domain::{Domain, MemoryDomain};
-use crate::events::{Event, EventKind, EventLabel, EventLogger};
+use crate::events::{
+    EventKind, EventLog, EventLogger, EventReason, RunContext, TraceWriter, program_name,
+};
 use crate::host::Host;
+use crate::launch::{
+    Answer, ControlSocket, Exec, JOB_OOM_SCORE_ADJ, REPORT_TIMEOUT, Report, Waited, Watch,
+    check_report, exec_job_args, guard_exe,
+};
 use crate::limits::{GuardPolicy, StopLimits, format_bytes};
 use crate::policy::{Decision, PressureWindow, StopReason, preflight};
 use crate::readings::{DomainReadings, Readings};
+use crate::signal::stop_self;
 use terminal::{TerminalForeground, restore_terminal};
 
 /// The exit code of a job that the guard stopped.
@@ -49,15 +55,19 @@ pub(crate) struct RunOptions {
     pub(crate) poll: Duration,
     pub(crate) term_grace: Duration,
     pub(crate) machine_guard: MachineGuardRequirement,
-    pub(crate) event_log: Option<PathBuf>,
+    pub(crate) event_log: EventLog,
+    pub(crate) log_command: bool,
+    pub(crate) record_readings: Option<PathBuf>,
     pub(crate) command: Vec<OsString>,
 }
 
-/// Why `oomwrap run` refused to launch the command.
+/// Why `oomwrap run` did not start the command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Refusal {
     /// A required machine-wide guard is not active.
     NoMachineGuard,
+    /// The launch failed before the command started.
+    LaunchFailed,
     /// A domain condition already holds.
     Preflight(StopReason),
 }
@@ -68,6 +78,9 @@ pub(crate) enum Outcome {
     /// The command ended on its own with this code.
     Exited(i32),
     Refused(Refusal),
+    /// The command could not be executed: 127 when it was not found, 126
+    /// when it cannot run, as a shell reports it.
+    NotRun(i32),
     /// The guard stopped the job.
     Stopped(StopReason),
     /// oomwrap received this signal number and ended the job.
@@ -77,8 +90,10 @@ pub(crate) enum Outcome {
 impl Outcome {
     pub(crate) fn exit_code(self) -> i32 {
         match self {
-            Self::Exited(code) => code,
-            Self::Refused(Refusal::NoMachineGuard) => CANNOT_GUARD_EXIT_CODE,
+            Self::Exited(code) | Self::NotRun(code) => code,
+            Self::Refused(Refusal::NoMachineGuard | Refusal::LaunchFailed) => {
+                CANNOT_GUARD_EXIT_CODE
+            }
             Self::Refused(Refusal::Preflight(_)) => PREFLIGHT_EXIT_CODE,
             Self::Stopped(_) => STOPPED_EXIT_CODE,
             Self::Interrupted(signal) => SIGNAL_EXIT_BASE + signal,
@@ -89,14 +104,17 @@ impl Outcome {
 pub(crate) fn run(options: RunOptions, host: &Host) -> Result<Outcome> {
     let command = command_strings(&options.command);
     let profile = effective_profile(options.profile, &command);
-    let mut logger = EventLogger::new(options.event_log.as_deref())?;
     let memory = MemoryDomain::find(host)?;
-    let domain = &memory.domain;
-    logger.log(
-        Event::new(EventKind::Preflight, EventLabel::Run)
-            .with_command(command.clone())
-            .with_domain(domain),
-    )?;
+    let mut context = RunContext {
+        backend: BackendKind::Poll,
+        domain: memory.domain.clone(),
+        program: command.first().map(|program| program_name(program)),
+        command: options.log_command.then(|| command.clone()),
+        pid: None,
+    };
+    let mut logger = EventLogger::open(&options.event_log, host.state_dir())?;
+    let trace = TraceWriter::create(options.record_readings.as_deref())?;
+    logger.log(&context.event(EventKind::Preflight))?;
 
     if needs_machine_guard(options.machine_guard, profile)
         && host
@@ -105,24 +123,28 @@ pub(crate) fn run(options: RunOptions, host: &Host) -> Result<Outcome> {
     {
         let message = missing_guard_message(profile, host.in_container);
         logger.log(
-            Event::new(EventKind::Refused, EventLabel::MachineGuard)
-                .with_command(command)
-                .with_domain(domain)
+            &context
+                .event(EventKind::Refused)
+                .with_reason(EventReason::NoMachineGuard)
                 .with_detail(message.clone()),
         )?;
         eprintln!("refusing to launch: {message}");
         return Ok(Outcome::Refused(Refusal::NoMachineGuard));
     }
 
-    let readings = memory.read(host)?;
-    let limits = options.policy.resolve(readings.size_bytes)?;
-    if let Some(reason) = preflight(&limits, &readings) {
-        let message = describe(reason, domain, &readings, &limits);
+    let domain_readings = memory.read(host)?;
+    let limits = options.policy.resolve(domain_readings.size_bytes)?;
+    if let Some(reason) = preflight(&limits, &domain_readings) {
+        let message = describe(reason, &memory.domain, &domain_readings, &limits);
         logger.log(
-            Event::new(EventKind::Refused, EventLabel::Reason(reason))
-                .with_command(command)
-                .with_domain(domain)
-                .with_readings(readings)
+            &context
+                .event(EventKind::Refused)
+                .with_reason(EventReason::Stop(reason))
+                .with_readings(Readings {
+                    elapsed_ms: 0,
+                    domain: domain_readings,
+                    job: None,
+                })
                 .with_detail(message.clone()),
         )?;
         eprintln!("refusing to launch: {message}");
@@ -130,21 +152,33 @@ pub(crate) fn run(options: RunOptions, host: &Host) -> Result<Outcome> {
     }
 
     let signals = ShutdownSignals::register()?;
-    let group = ProcessGroup::spawn(&options.command)?;
+    let socket = ControlSocket::bind(host.control_parent())?;
+    let exe = guard_exe();
+    let group = ProcessGroup::spawn(
+        exe.as_os_str(),
+        &exec_job_args(socket.path(), &options.command),
+    )
+    .context("failed to start the launch")?;
+    context.pid = Some(group.leader_pid());
     let mut supervisor = Supervisor {
         group,
         terminal: None,
         logger,
-        command,
+        context,
         memory,
+        trace,
         term_grace: options.term_grace,
     };
-    match TerminalForeground::handoff_to_child(supervisor.group.pgid()) {
-        Ok(terminal) => supervisor.terminal = terminal,
-        Err(error) => return supervisor.stop(StopCause::GuardError(error)),
+    if let Some(outcome) = supervisor.launch(socket, &signals)? {
+        return Ok(outcome);
     }
-    let launched = supervisor.event(EventKind::Launched);
-    supervisor.logger.log_or_warn(launched);
+    let launched = supervisor
+        .context
+        .event(EventKind::Launched)
+        .with_limits(limits)
+        .with_oom_score_adj(JOB_OOM_SCORE_ADJ)
+        .with_detail("poll backend: no job limit holds; the domain's stop conditions apply");
+    supervisor.logger.log_or_warn(&launched);
     supervisor.watch(host, &limits, options.poll, &signals)
 }
 
@@ -210,12 +244,91 @@ struct Supervisor {
     group: ProcessGroup,
     terminal: Option<TerminalForeground>,
     logger: EventLogger,
-    command: Vec<String>,
+    context: RunContext,
     memory: MemoryDomain,
+    trace: TraceWriter,
     term_grace: Duration,
 }
 
 impl Supervisor {
+    /// The handshake with `exec-job`. Returns the outcome when the command
+    /// did not start, and `None` when it runs.
+    fn launch(
+        &mut self,
+        socket: ControlSocket,
+        signals: &ShutdownSignals,
+    ) -> Result<Option<Outcome>> {
+        let group = &mut self.group;
+        let waited = socket.wait_for_report(REPORT_TIMEOUT, || watch_launch(signals, group));
+        let (mut control, report) = match waited {
+            Waited::Reported(control, report) => (control, report),
+            Waited::Failed(failure) => {
+                self.group.kill();
+                return self.refuse_launch(&failure.to_string()).map(Some);
+            }
+            Waited::Interrupted(signal) => {
+                self.group.kill();
+                return Ok(Some(self.interrupted_before_start(signal)));
+            }
+        };
+        if let Err(fault) = check_report(&report, self.group.leader_pid()) {
+            let _ = control.answer(Answer::Abort);
+            self.group.kill();
+            return self.refuse_launch(&fault.to_string()).map(Some);
+        }
+        warn_about_score(&report);
+        match TerminalForeground::handoff_to_job(self.group.pgid()) {
+            Ok(terminal) => self.terminal = terminal,
+            Err(error) => {
+                let _ = control.answer(Answer::Abort);
+                self.group.kill();
+                return Err(error);
+            }
+        }
+        if let Err(error) = control.answer(Answer::Go) {
+            restore_terminal(&mut self.terminal);
+            self.group.kill();
+            return Err(anyhow!(error).context("failed to start the command"));
+        }
+        match control.wait_for_exec(REPORT_TIMEOUT) {
+            Exec::Started => Ok(None),
+            Exec::Failed(failure) => {
+                restore_terminal(&mut self.terminal);
+                self.group.reap();
+                let event = self
+                    .context
+                    .event(EventKind::ExecFailed)
+                    .with_exit(failure.exit_code())
+                    .with_detail(failure.message.clone());
+                self.logger.log_or_warn(&event);
+                eprintln!("oomwrap: {}", failure.message);
+                Ok(Some(Outcome::NotRun(failure.exit_code())))
+            }
+        }
+    }
+
+    fn refuse_launch(&mut self, cause: &str) -> Result<Outcome> {
+        let event = self
+            .context
+            .event(EventKind::Refused)
+            .with_reason(EventReason::LaunchFailed)
+            .with_detail(cause);
+        self.logger.log_or_warn(&event);
+        eprintln!("refusing to launch: {cause}; the command did not start");
+        Ok(Outcome::Refused(Refusal::LaunchFailed))
+    }
+
+    fn interrupted_before_start(&mut self, signal: i32) -> Outcome {
+        let event = self
+            .context
+            .event(EventKind::Interrupted)
+            .with_signal(signal)
+            .with_detail("received the signal during the launch; the command did not start");
+        self.logger.log_or_warn(&event);
+        eprintln!("received signal {signal} during the launch; the command did not start");
+        Outcome::Interrupted(signal)
+    }
+
     fn watch(
         &mut self,
         host: &Host,
@@ -225,13 +338,15 @@ impl Supervisor {
     ) -> Result<Outcome> {
         let started = Instant::now();
         let mut window = PressureWindow::default();
+        let mut state = self.group.poll();
         loop {
             if let Some(signal) = signals.pending() {
                 return self.stop(StopCause::Signal(signal));
             }
-            match self.group.try_wait() {
-                Ok(Some(status)) => return self.finish(status),
-                Ok(None) => {}
+            match state {
+                Ok(LeaderState::Exited(exit)) => return self.finish(exit),
+                Ok(LeaderState::Stopped) => self.follow_job_stop(),
+                Ok(LeaderState::Running) => {}
                 Err(error) => return self.stop(StopCause::GuardError(anyhow!(error))),
             }
             let readings = match self.memory.read(host) {
@@ -242,7 +357,9 @@ impl Supervisor {
                 },
                 Err(error) => return self.stop(StopCause::GuardError(error)),
             };
-            if let Decision::Stop(reason) = Decision::evaluate(limits, &readings, &mut window) {
+            let decision = Decision::evaluate(limits, &readings, &mut window);
+            self.trace.record(&readings, decision);
+            if let Decision::Stop(reason) = decision {
                 let message = describe(reason, &self.memory.domain, &readings.domain, limits);
                 return self.stop(StopCause::Pressure {
                     reason,
@@ -250,24 +367,44 @@ impl Supervisor {
                     message,
                 });
             }
-            match sleep_until_poll_signal_or_exit(poll, signals, &mut self.group) {
-                Ok(Some(status)) => return self.finish(status),
-                Ok(None) => {}
-                Err(error) => return self.stop(StopCause::GuardError(anyhow!(error))),
-            }
+            state = sleep_until_poll_signal_or_change(poll, signals, &mut self.group);
         }
     }
 
+    /// The job stopped, as on Ctrl-Z. With the terminal handed over, oomwrap
+    /// takes it back and stops itself, so the shell sees a stopped job; when
+    /// the shell continues oomwrap, the job gets the terminal again and
+    /// continues too. Without a terminal, the job stays stopped until
+    /// whoever stopped it continues it.
+    fn follow_job_stop(&mut self) {
+        let Some(terminal) = &mut self.terminal else {
+            return;
+        };
+        if let Err(error) = terminal.take_back() {
+            eprintln!("warning: {error:#}");
+        }
+        if let Err(error) = stop_self() {
+            eprintln!("warning: failed to stop oomwrap with the job: {error}");
+        }
+        if let Err(error) = terminal.give_to_job() {
+            eprintln!("warning: {error:#}");
+        }
+        self.group.resume();
+    }
+
     /// The command's main process exited: end what remains of its group.
-    fn finish(&mut self, status: ExitStatus) -> Result<Outcome> {
-        let code = status_to_code(status);
-        let exit = self.event(EventKind::ChildExit).with_exit(code);
-        self.logger.log_or_warn(exit);
+    fn finish(&mut self, exit: LeaderExit) -> Result<Outcome> {
+        let code = exit.code();
+        let mut event = self.context.event(EventKind::Exited).with_exit(code);
+        if let LeaderExit::Signal(signal) = exit {
+            event = event.with_signal(signal);
+        }
+        self.logger.log_or_warn(&event);
         if self.group.has_members() {
-            let cleanup = self
-                .event(EventKind::ProcessGroupCleanup)
-                .with_detail("leader exited while process group still had running members");
-            self.logger.log_or_warn(cleanup);
+            let cleanup = self.context.event(EventKind::Cleanup).with_detail(
+                "the command exited while its process group still had running members",
+            );
+            self.logger.log_or_warn(&cleanup);
         }
         restore_terminal(&mut self.terminal);
         self.group.terminate(self.term_grace)?;
@@ -278,32 +415,35 @@ impl Supervisor {
     fn stop(&mut self, cause: StopCause) -> Result<Outcome> {
         restore_terminal(&mut self.terminal);
         let pgid = self.group.pgid();
-        match &cause {
+        let event = match &cause {
             StopCause::Pressure {
                 reason,
                 readings,
                 message,
             } => {
-                let event = Event::new(EventKind::MemoryPressureKill, EventLabel::Reason(*reason))
-                    .with_command(self.command.clone())
-                    .with_pid(self.group.leader_pid())
-                    .with_domain(&self.memory.domain)
-                    .with_readings(readings.domain)
-                    .with_detail(message.clone());
-                self.logger.log_or_warn(event);
                 eprintln!("memory pressure: {message}; terminating process group {pgid}");
+                self.context
+                    .event(EventKind::Stopped)
+                    .with_reason(EventReason::Stop(*reason))
+                    .with_readings(*readings)
+                    .with_exit(STOPPED_EXIT_CODE)
+                    .with_detail(message.clone())
             }
             StopCause::Signal(signal) => {
-                let event = self
-                    .event(EventKind::ParentSignalKill)
-                    .with_detail(format!("received signal {signal}"));
-                self.logger.log_or_warn(event);
                 eprintln!("received signal {signal}; terminating process group {pgid}");
+                self.context
+                    .event(EventKind::Interrupted)
+                    .with_signal(*signal)
+                    .with_exit(SIGNAL_EXIT_BASE + signal)
             }
             StopCause::GuardError(error) => {
                 eprintln!("guard error after launch: {error:#}; terminating process group {pgid}");
+                self.context
+                    .event(EventKind::GuardError)
+                    .with_detail(format!("{error:#}"))
             }
-        }
+        };
+        self.logger.log_or_warn(&event);
         let terminated = self.group.terminate(self.term_grace);
         match cause {
             StopCause::Pressure { reason, .. } => {
@@ -322,12 +462,24 @@ impl Supervisor {
             }
         }
     }
+}
 
-    fn event(&self, kind: EventKind) -> Event {
-        Event::new(kind, EventLabel::Run)
-            .with_command(self.command.clone())
-            .with_pid(self.group.leader_pid())
-            .with_domain(&self.memory.domain)
+/// What the guard sees of the launch while it waits for the report.
+fn watch_launch(signals: &ShutdownSignals, group: &mut ProcessGroup) -> Watch {
+    if let Some(signal) = signals.pending() {
+        return Watch::Interrupted(signal);
+    }
+    match group.poll() {
+        Ok(LeaderState::Running | LeaderState::Stopped) => Watch::Continue,
+        Ok(LeaderState::Exited(_)) | Err(_) => Watch::LaunchEnded,
+    }
+}
+
+fn warn_about_score(report: &Report) {
+    if let Some(error) = &report.oom_score_adj_error {
+        eprintln!(
+            "warning: the job could not raise its oom_score_adj to {JOB_OOM_SCORE_ADJ}: {error}"
+        );
     }
 }
 
@@ -362,18 +514,21 @@ impl ShutdownSignals {
     }
 }
 
+/// Sleeps one poll interval, and returns early when a signal arrives or the
+/// leader stops or exits.
 // A mutant here only changes how often the loop wakes up; no test can see
 // that without depending on timing.
 #[cfg_attr(test, mutants::skip)]
-fn sleep_until_poll_signal_or_exit(
+fn sleep_until_poll_signal_or_change(
     poll: Duration,
     signals: &ShutdownSignals,
     group: &mut ProcessGroup,
-) -> io::Result<Option<ExitStatus>> {
+) -> io::Result<LeaderState> {
     let started = Instant::now();
     while signals.pending().is_none() {
-        if let Some(status) = group.try_wait()? {
-            return Ok(Some(status));
+        let state = group.poll()?;
+        if state != LeaderState::Running {
+            return Ok(state);
         }
         let elapsed = started.elapsed();
         if elapsed >= poll {
@@ -385,7 +540,7 @@ fn sleep_until_poll_signal_or_exit(
         }
         thread::sleep(remaining.min(Duration::from_millis(100)));
     }
-    Ok(None)
+    Ok(LeaderState::Running)
 }
 
 pub(crate) fn command_strings(command: &[OsString]) -> Vec<String> {
@@ -393,16 +548,6 @@ pub(crate) fn command_strings(command: &[OsString]) -> Vec<String> {
         .iter()
         .map(|arg| arg.to_string_lossy().to_string())
         .collect()
-}
-
-fn status_to_code(status: ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
-    }
-    if let Some(signal) = status.signal() {
-        return SIGNAL_EXIT_BASE + signal;
-    }
-    1
 }
 
 #[cfg(test)]
@@ -422,7 +567,9 @@ mod tests {
     fn outcomes_map_to_exit_codes() {
         let reason = StopReason::DomainFloor;
         assert_eq!(Outcome::Exited(7).exit_code(), 7);
+        assert_eq!(Outcome::NotRun(127).exit_code(), 127);
         assert_eq!(Outcome::Refused(Refusal::NoMachineGuard).exit_code(), 3);
+        assert_eq!(Outcome::Refused(Refusal::LaunchFailed).exit_code(), 3);
         assert_eq!(Outcome::Refused(Refusal::Preflight(reason)).exit_code(), 4);
         assert_eq!(Outcome::Stopped(reason).exit_code(), 137);
         assert_eq!(Outcome::Interrupted(15).exit_code(), 143);
@@ -498,5 +645,22 @@ mod tests {
             describe(StopReason::JobLimit, &Domain::Machine, &readings, &limits),
             "job_limit"
         );
+    }
+
+    #[test]
+    fn a_signal_or_the_end_of_the_launch_ends_the_wait() {
+        let signals = ShutdownSignals {
+            received: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut group = ProcessGroup::spawn("true".as_ref(), &[]).unwrap();
+        group.wait().unwrap();
+        assert_eq!(watch_launch(&signals, &mut group), Watch::LaunchEnded);
+        signals.received.store(2, Ordering::SeqCst);
+        assert_eq!(watch_launch(&signals, &mut group), Watch::Interrupted(2));
+        let mut sleeper = ProcessGroup::spawn("sleep".as_ref(), &["5".into()]).unwrap();
+        signals.received.store(0, Ordering::SeqCst);
+        let running = watch_launch(&signals, &mut sleeper);
+        sleeper.kill();
+        assert_eq!(running, Watch::Continue);
     }
 }

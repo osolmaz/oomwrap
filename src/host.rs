@@ -33,6 +33,12 @@ pub(crate) struct Host {
     /// oomwrap runs in a container, where a guard of the host is not visible.
     pub(crate) in_container: bool,
     pub(crate) home: Option<PathBuf>,
+    /// `XDG_STATE_HOME`, the folder of the default event log.
+    pub(crate) state_home: Option<PathBuf>,
+    /// `XDG_RUNTIME_DIR`, where the control socket of a launch goes.
+    pub(crate) runtime_dir: Option<PathBuf>,
+    /// The folder for temporary files, from `TMPDIR`.
+    pub(crate) temp_dir: PathBuf,
 }
 
 impl Host {
@@ -54,6 +60,26 @@ impl Host {
                 || Path::new("/.dockerenv").exists()
                 || Path::new("/run/.containerenv").exists(),
             home: env::var_os("HOME").map(PathBuf::from),
+            state_home: absolute_path_var("XDG_STATE_HOME"),
+            runtime_dir: absolute_path_var("XDG_RUNTIME_DIR"),
+            temp_dir: env::temp_dir(),
+        }
+    }
+
+    /// `${XDG_STATE_HOME:-~/.local/state}`.
+    pub(crate) fn state_dir(&self) -> Result<PathBuf> {
+        match &self.state_home {
+            Some(dir) => Ok(dir.clone()),
+            None => Ok(self.home()?.join(".local/state")),
+        }
+    }
+
+    /// The folder for the control socket: the user's runtime folder when it
+    /// exists, the temporary folder otherwise.
+    pub(crate) fn control_parent(&self) -> &Path {
+        match &self.runtime_dir {
+            Some(dir) if dir.is_dir() => dir,
+            _ => &self.temp_dir,
         }
     }
 
@@ -130,6 +156,14 @@ pub(crate) enum MachineGuard {
     SystemdOomd,
     /// A guard that the configuration names by its process name.
     Declared(String),
+}
+
+/// An environment variable that names an absolute path; the XDG rules
+/// ignore a relative one.
+fn absolute_path_var(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
 pub(crate) fn read_file(path: &Path) -> Result<String> {
@@ -351,6 +385,9 @@ pub(crate) mod tests {
                 machine_guard_override: Some(false),
                 in_container: false,
                 home: None,
+                state_home: None,
+                runtime_dir: None,
+                temp_dir: self.dir.path().to_path_buf(),
             }
         }
 
@@ -449,6 +486,26 @@ pub(crate) mod tests {
         assert!(host.machine_guards(None).unwrap().is_empty());
         host.machine_guard_override = Some(true);
         assert_eq!(host.machine_guards(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn state_and_runtime_folders_follow_the_xdg_rules() {
+        let fake = FakeHost::new();
+        let mut host = fake.host();
+        assert!(host.state_dir().is_err());
+        host.home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            host.state_dir().unwrap(),
+            PathBuf::from("/home/u/.local/state")
+        );
+        host.state_home = Some(PathBuf::from("/state"));
+        assert_eq!(host.state_dir().unwrap(), PathBuf::from("/state"));
+        assert_eq!(host.control_parent(), host.temp_dir.as_path());
+        host.runtime_dir = Some(PathBuf::from("/missing/runtime"));
+        assert_eq!(host.control_parent(), host.temp_dir.as_path());
+        let runtime = fake.cgroup_root();
+        host.runtime_dir = Some(runtime.clone());
+        assert_eq!(host.control_parent(), runtime.as_path());
     }
 
     #[test]

@@ -96,7 +96,7 @@ job limit holds.
 systemd-run --user --scope --quiet --collect \
   --unit oomwrap-<profile>-<random> \
   -p MemoryMax=<bytes> -p MemoryHigh=<bytes> [-p MemorySwapMax=<bytes>] \
-  -- /proc/<guard pid>/exe exec-job --control-fd <n> -- <command> [args...]
+  -- /proc/<guard pid>/exe exec-job --control <socket> -- <command> [args...]
 ```
 
 oomwrap spawns `systemd-run` in a new process group, as it spawns the command today, so terminal
@@ -114,21 +114,28 @@ Sizes are rounded down to a whole number of pages (the page size from `sysconf`,
 on every machine) before they go to systemd, because the kernel stores limits in pages.
 
 A probe on systemd 255 confirmed the assumptions of this section: an inherited descriptor reaches
-the program that `systemd-run --scope` executes; that program runs in the scope's cgroup; the kernel
+the program that `systemd-run --scope` executes (no longer needed, see below); that program runs in the scope's cgroup; the kernel
 reads `MemoryMax=100000001` back as `99999744`, rounded down to 4 KiB pages; without `OOMPolicy`,
 `memory.oom.group` stays `0` and the job inherits the user manager's `oom_score_adj`; and a program
 started as `/proc/<pid>/exe` runs. The CI runner matrix repeats these checks on systemd 249.
 
 **The command starts once, after the check.** `exec-job` is a hidden subcommand of oomwrap. Before
-the launch, oomwrap makes a Unix socket pair and passes one end to `exec-job` as `--control-fd`.
+the launch, oomwrap listens on a Unix socket in a new folder that only the user can enter (mode
+`0700`, in `$XDG_RUNTIME_DIR`, or the temporary folder without one), and passes its path to
+`exec-job` as `--control`. (The first version of this plan passed one end of a socket pair as
+`--control-fd <n>`. Phase 3 changed it: safe Rust cannot take an inherited descriptor by its number,
+because `OwnedFd::from_raw_fd` is unsafe, and the crate forbids unsafe code. A socket that
+`exec-job` opens itself is close-on-exec from the start, and `systemd-run` no longer has to pass a
+descriptor.) The guard removes the folder as soon as `exec-job` has connected.
 
-1. `exec-job` writes `1000` to `/proc/self/oom_score_adj`, reads `/proc/self/cgroup`, and sends a
-   protocol version and the cgroup path.
+1. `exec-job` connects, writes `1000` to `/proc/self/oom_score_adj`, reads `/proc/self/cgroup`, and
+   sends a protocol version, its process ID and the cgroup path. oomwrap checks that the process ID
+   is the one it launched, because `systemd-run --scope` executes `exec-job` in its own process.
 2. oomwrap checks the version and that the path names `<unit>.scope`, and reads `memory.max`,
    `memory.high` and, when set, `memory.swap.max` back from that cgroup, compared in pages.
-3. When all of them hold the requested values, oomwrap answers `go`. `exec-job` marks the socket
-   close-on-exec and executes the command. End of file on the socket tells oomwrap that the exec
-   worked. When the exec fails, `exec-job` sends the error and exits; oomwrap reports exit 127 (not
+3. When all of them hold the requested values, oomwrap gives the terminal to the job's process
+   group and answers `go`. `exec-job` executes the command, which closes its close-on-exec socket.
+   End of file on the socket tells oomwrap that the exec worked. When the exec fails, `exec-job` sends the error and exits; oomwrap reports exit 127 (not
    found) or 126 (cannot run), as a shell does, never as the command's own exit code.
 4. When the check fails, oomwrap answers `abort`, `exec-job` exits without starting the command,
    and `auto` starts the command once with `poll` while `cgroup` exits with 3.
@@ -270,7 +277,11 @@ oomwrap.
 
 **Job control.** When the job stops on `SIGTSTP` (Ctrl-Z), oomwrap takes the terminal back and
 stops itself, so the shell sees a stopped job. On `SIGCONT`, oomwrap gives the terminal to the job
-and continues it. 0.1.0 leaves the shell with a stopped job that it cannot resume.
+and continues it. 0.1.0 leaves the shell with a stopped job that it cannot resume. After `bg`, the
+job continues in the background and the terminal stays with the shell. Without a terminal that
+oomwrap handed to the job, a stopped job stays stopped until whoever stopped it continues it, and
+oomwrap keeps guarding it. A stop of a stopped job sends `SIGCONT` after `SIGTERM`, so the job can
+handle the `SIGTERM`. oomwrap waits for the job with `waitpid`, which reports the stop.
 
 **When oomwrap itself ends.** If oomwrap is killed with `SIGKILL`, the `cgroup` backend keeps the
 kernel limits in force: the job goes on under `memory.max` and `memory.high`, without the pressure
@@ -309,6 +320,25 @@ the table above and the readings that decided it.
 
 `--record-readings <path>` writes every `Readings` value with the policy's decision as JSON lines.
 This is the trace format of the replay tests.
+
+The events of schema version 1, as phase 3 made them:
+
+| `event` | When | Fields beyond the common ones |
+| --- | --- | --- |
+| `preflight` | Before the checks | |
+| `refused` | A check refused the launch; the command did not start | `reason` (`no_machine_guard`, `launch_failed`, `domain_floor`, `domain_pressure`), `readings` for a domain reason, `detail` |
+| `launched` | The command runs | `limits` (bytes, PSI percent, milliseconds), `oom_score_adj`, `detail` |
+| `exec_failed` | The command could not be executed | `exit_code` (126, 127), `detail` |
+| `exited` | The command ended on its own | `exit_code`, `signal` when it ended on one |
+| `cleanup` | Members of the group remained after the command ended | `detail` |
+| `stopped` | The guard stopped the job | `reason`, `readings`, `exit_code`, `detail` |
+| `interrupted` | oomwrap received a signal and ended the job, or the launch | `signal`, `exit_code` |
+| `guard_error` | oomwrap could no longer guard the job and ended it | `detail` |
+
+Every event has `schema_version`, `unix_ms`, `event`, `backend`, `domain`, `program` (the file name
+of the program) and, after the launch, `pid`; `command` only with `--log-command`. Fields without a
+value are left out. The day of a default log file is the UTC day, and a trace line is
+`{"readings": {...}, "decision": "continue"}` or `{"decision": {"stop": "<reason>"}}`.
 
 ### doctor and inspect
 
@@ -462,7 +492,12 @@ reads 0.2.0 flags while it runs 0.1.0, or the reverse.
    `--job-pressure` flags come with the `cgroup` backend in phase 4, because only that backend
    reads the job's own pressure.
 3. **Launch and supervision.** `exec-job` with the handshake and the score of `1000`, job control,
-   the event log changes, the schema version and `--record-readings`.
+   the event log changes, the schema version and `--record-readings`. The control socket is reached
+   by path (see [Launch in a transient scope](#launch-in-a-transient-scope)). `oomwrap --skill`
+   counts only as the first argument, so a guarded command can take its own `--skill`. The
+   handshake cases that need a slow or broken launch (a signal during the handshake, a launch that
+   ends before its report, a protocol mismatch) are tested on the handshake itself here, and end to
+   end with the fake `systemd-run` of phase 4.
 4. **The `cgroup` backend:** the four checks, the scope launch through `/proc/<guard pid>/exe`, the
    cgroup check in the handshake, page-rounded sizes, the launch-time cap of `--memory-max`,
    readings, `job_limit` and `outside_oom_kill`, the stop sequence, the cleanup at the command's
@@ -542,9 +577,9 @@ What stays out:
 - **A job that lowers its own score.** An unprivileged process can lower its `oom_score_adj` again,
   down to the lowest value a privileged process set for it. A job that does so is no longer the
   first victim of a machine-wide kill; its own limits still hold.
-- **The control socket through `systemd-run`.** The handshake needs `systemd-run` to pass an
-  inherited descriptor to the program it executes. A probe confirmed it on systemd 255; the CI
-  runner matrix checks it on systemd 249 and 255.
+- **The control socket through `systemd-run`.** `exec-job` connects to the socket by its path, so
+  `systemd-run` passes no descriptor; the job only needs to see the guard's runtime folder, which a
+  scope does not hide. The CI runner matrix checks the handshake on systemd 249 and 255.
 - **Launch cost.** `systemd-run` adds a bus round trip to each launch. Phase 6 measures it, and the
   default shim list stays limited to long-running tools.
 - **Domain pressure default.** `20%` for `10s` is provisional until the machine pressure traces of

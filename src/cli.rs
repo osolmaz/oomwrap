@@ -11,7 +11,9 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::config::Profile;
 use crate::doctor::{self, Defaults};
+use crate::events::EventLog;
 use crate::host::Host;
+use crate::launch;
 use crate::limits::{GuardPolicy, Pressure, PressureLimit, Size, SizeSetting, parse_duration};
 use crate::shims::{self, ScriptFloors, default_bin_dir};
 use crate::supervise::{self, MachineGuardRequirement, RunOptions};
@@ -37,6 +39,19 @@ enum Commands {
     Wrap(WrapArgs),
     Unwrap(UnwrapArgs),
     Inspect(InspectArgs),
+    /// The first process of a guarded job; `oomwrap run` starts it.
+    #[command(hide = true)]
+    ExecJob(ExecJobArgs),
+}
+
+#[derive(Args, Debug)]
+struct ExecJobArgs {
+    /// The control socket of the guard.
+    #[arg(long)]
+    control: PathBuf,
+
+    #[arg(required = true, last = true)]
+    command: Vec<OsString>,
 }
 
 #[derive(Args, Debug)]
@@ -81,8 +96,17 @@ struct RunArgs {
     #[arg(long, conflicts_with = "require_machine_guard")]
     allow_no_machine_guard: bool,
 
+    /// The event log file, or none [default: one file per day in ${XDG_STATE_HOME:-~/.local/state}/oomwrap]
+    #[arg(long, value_name = "PATH|none")]
+    event_log: Option<EventLog>,
+
+    /// Log the full command line; by default, events hold the program name only
     #[arg(long)]
-    event_log: Option<PathBuf>,
+    log_command: bool,
+
+    /// Write every reading and the policy's decision to this file, as JSON lines
+    #[arg(long, value_name = "PATH")]
+    record_readings: Option<PathBuf>,
 
     #[arg(long)]
     use_systemd_scope: bool,
@@ -179,6 +203,7 @@ fn dispatch(command: Commands, host: &Host) -> Result<i32> {
             shims::wrap(&args.path, &floors, args.force).map(|()| 0)
         }
         Commands::Unwrap(args) => shims::unwrap(&args.path).map(|()| 0),
+        Commands::ExecJob(args) => Ok(launch::exec_job(&args.control, &args.command)),
     }
 }
 
@@ -212,7 +237,9 @@ fn run_guard(args: RunArgs, host: &Host) -> Result<i32> {
         poll: args.poll,
         term_grace: args.term_grace,
         machine_guard,
-        event_log: args.event_log,
+        event_log: args.event_log.unwrap_or(EventLog::Default),
+        log_command: args.log_command,
+        record_readings: args.record_readings,
         command: args.command,
     };
     supervise::run(options, host).map(|outcome| outcome.exit_code())
@@ -262,6 +289,58 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
         let cause = error.source().unwrap();
         assert!(error_chain(cause).starts_with("invalid duration"));
+    }
+
+    #[test]
+    fn exec_job_takes_the_command_after_the_separator() {
+        let cli = Cli::try_parse_from([
+            "oomwrap",
+            "exec-job",
+            "--control",
+            "/run/c",
+            "--",
+            "tool",
+            "--skill",
+            "-x",
+        ])
+        .unwrap();
+        let Commands::ExecJob(args) = cli.command else {
+            panic!("not exec-job");
+        };
+        assert_eq!(args.control, PathBuf::from("/run/c"));
+        assert_eq!(args.command, ["tool", "--skill", "-x"]);
+        assert!(Cli::try_parse_from(["oomwrap", "exec-job", "--control", "/c"]).is_err());
+    }
+
+    #[test]
+    fn the_event_log_takes_a_path_or_none() {
+        let parse = |args: &[&str]| {
+            let cli =
+                Cli::try_parse_from([&["oomwrap", "run"][..], args, &["--", "true"]].concat())
+                    .unwrap();
+            let Commands::Run(args) = cli.command else {
+                panic!("not a run command");
+            };
+            args
+        };
+        assert_eq!(parse(&[]).event_log, None);
+        assert_eq!(
+            parse(&["--event-log", "none"]).event_log,
+            Some(EventLog::Off)
+        );
+        let args = parse(&[
+            "--event-log",
+            "e.jsonl",
+            "--log-command",
+            "--record-readings",
+            "t.jsonl",
+        ]);
+        assert_eq!(
+            args.event_log,
+            Some(EventLog::File(PathBuf::from("e.jsonl")))
+        );
+        assert!(args.log_command);
+        assert_eq!(args.record_readings, Some(PathBuf::from("t.jsonl")));
     }
 
     #[test]

@@ -40,7 +40,10 @@ impl fmt::Display for StopReason {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// What the policy decided on one reading; a trace records it as
+/// `"continue"` or `{"stop": "<reason>"}`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Decision {
     Continue,
     Stop(StopReason),
