@@ -319,6 +319,11 @@ impl GuardPolicy {
     }
 }
 
+/// How often a guard reads, unless `--poll` says otherwise.
+pub(crate) const DEFAULT_POLL: Duration = Duration::from_secs(1);
+/// How long a stop waits after `SIGTERM`, unless `--term-grace` says otherwise.
+pub(crate) const DEFAULT_TERM_GRACE: Duration = Duration::from_secs(10);
+
 /// Parses a duration: a number of seconds, or a number with `ms`, `s` or `m`.
 pub(crate) fn parse_duration(input: &str) -> Result<Duration> {
     let trimmed = input.trim();
@@ -352,6 +357,17 @@ pub(crate) fn parse_duration(input: &str) -> Result<Duration> {
 fn duration_from_secs(seconds: f64) -> Result<Duration> {
     Duration::try_from_secs_f64(seconds)
         .map_err(|_| anyhow!("duration must be a non-negative finite number"))
+}
+
+/// Writes a duration as `parse_duration` reads it: whole seconds as `10s`,
+/// anything else in milliseconds.
+pub(crate) fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis.is_multiple_of(1000) {
+        format!("{}s", millis / 1000)
+    } else {
+        format!("{millis}ms")
+    }
 }
 
 /// Formats a byte count for messages, in GiB, MiB or bytes.

@@ -9,20 +9,18 @@ use anyhow::{Result, bail};
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 
-use crate::config::Profile;
-use crate::doctor::{self, Defaults};
+use crate::config::{BackendRequest, Policy, Profile, Settings, effective_profile};
+use crate::doctor;
 use crate::events::EventLog;
 use crate::host::Host;
 use crate::job_limits::JobLimitSettings;
 use crate::launch;
-use crate::limits::{GuardPolicy, Pressure, PressureLimit, Size, SizeSetting, parse_duration};
-use crate::shims::{self, ScriptFloors, default_bin_dir};
-use crate::supervise::{self, BackendRequest, MachineGuardRequirement, RunOptions};
-
-const DEFAULTS: Defaults = Defaults {
-    poll: "1s",
-    term_grace: "10s",
+use crate::limits::{
+    DEFAULT_POLL, DEFAULT_TERM_GRACE, GuardPolicy, Pressure, PressureLimit, Size, SizeSetting,
+    parse_duration,
 };
+use crate::shims::{self, default_bin_dir};
+use crate::supervise::{self, MachineGuardRequirement, RunOptions};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -76,6 +74,10 @@ struct HoldScopeArgs {
 struct DoctorArgs {
     #[arg(long)]
     json: bool,
+
+    /// The profile whose settings the report resolves
+    #[arg(long, value_enum, default_value_t = Profile::Generic)]
+    profile: Profile,
 }
 
 #[derive(Args, Debug)]
@@ -110,8 +112,9 @@ struct RunArgs {
     #[arg(long, value_enum, default_value_t = Profile::Auto)]
     profile: Profile,
 
-    #[arg(long, value_enum, default_value_t = BackendFlag::Auto)]
-    backend: BackendFlag,
+    /// The backend [default: auto]
+    #[arg(long, value_enum)]
+    backend: Option<BackendFlag>,
 
     /// Hard limit of the job [default: smallest of 85%, the free room minus --min-mem, and the lowest memory.max above the scope]
     #[arg(long)]
@@ -146,11 +149,13 @@ struct RunArgs {
     #[arg(long, allow_negative_numbers = true, value_parser = parse_duration)]
     job_pressure_for: Option<Duration>,
 
-    #[arg(long, allow_negative_numbers = true, default_value = DEFAULTS.poll, value_parser = parse_duration)]
-    poll: Duration,
+    /// How often the guard reads [default: 1s]
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_duration)]
+    poll: Option<Duration>,
 
-    #[arg(long, allow_negative_numbers = true, default_value = DEFAULTS.term_grace, value_parser = parse_duration)]
-    term_grace: Duration,
+    /// How long a stop waits after SIGTERM [default: 10s]
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_duration)]
+    term_grace: Option<Duration>,
 
     #[arg(long, conflicts_with = "allow_no_machine_guard")]
     require_machine_guard: bool,
@@ -170,6 +175,10 @@ struct RunArgs {
     #[arg(long, value_name = "PATH")]
     record_readings: Option<PathBuf>,
 
+    /// The run comes from the shim or wrapper of this tool; with --profile auto, its name can tell the profile
+    #[arg(long, value_name = "TOOL")]
+    shim: Option<String>,
+
     /// The command starts at its first word; an unknown flag before it is an
     /// error, never the command.
     #[arg(required = true, trailing_var_arg = true)]
@@ -183,10 +192,6 @@ struct InstallShimsArgs {
 
     #[arg(long = "tool")]
     tools: Vec<String>,
-
-    /// The `--min-mem` that the shims pass; without it, `oomwrap run` decides
-    #[arg(long)]
-    min_mem: Option<String>,
 
     #[arg(long)]
     force: bool,
@@ -204,10 +209,6 @@ struct UninstallShimsArgs {
 #[derive(Args, Debug)]
 struct WrapArgs {
     path: PathBuf,
-
-    /// The `--min-mem` that the wrapper passes; without it, `oomwrap run` decides
-    #[arg(long)]
-    min_mem: Option<String>,
 
     #[arg(long)]
     force: bool,
@@ -235,27 +236,19 @@ pub(crate) fn run(host: &Host) -> i32 {
 
 fn dispatch(command: Commands, host: &Host) -> Result<i32> {
     match command {
-        Commands::Doctor(args) => doctor::doctor(host, args.json).map(|()| 0),
-        Commands::Inspect(args) => doctor::inspect(host, &DEFAULTS, args.json).map(|()| 0),
+        Commands::Doctor(args) => doctor::doctor(host, args.profile, args.json).map(|()| 0),
+        Commands::Inspect(args) => doctor::inspect(host, args.json).map(|()| 0),
         Commands::Run(args) => run_guard(args, host),
         Commands::InstallShims(args) => {
             let bin_dir = bin_dir_or_default(args.bin_dir, host)?;
-            let floors = ScriptFloors {
-                min_mem: args.min_mem.as_deref(),
-            };
-            shims::install_shims(&bin_dir, &args.tools, &floors, args.force).map(|()| 0)
+            shims::install_shims(&bin_dir, &args.tools, args.force).map(|()| 0)
         }
         Commands::UninstallShims(args) => {
             let bin_dir = bin_dir_or_default(args.bin_dir, host)?;
             shims::uninstall_shims(&bin_dir, &args.tools).map(|()| 0)
         }
-        Commands::Wrap(args) => {
-            let floors = ScriptFloors {
-                min_mem: args.min_mem.as_deref(),
-            };
-            shims::wrap(&args.path, &floors, args.force).map(|()| 0)
-        }
-        Commands::Unwrap(args) => shims::unwrap(&args.path).map(|()| 0),
+        Commands::Wrap(args) => shims::wrap(host, &args.path, args.force).map(|()| 0),
+        Commands::Unwrap(args) => shims::unwrap(host, &args.path).map(|()| 0),
         Commands::ExecJob(args) => Ok(launch::exec_job(
             &args.control,
             args.hold_scope.as_deref(),
@@ -266,56 +259,100 @@ fn dispatch(command: Commands, host: &Host) -> Result<i32> {
     }
 }
 
+impl RunArgs {
+    /// The settings that the flags give; the policy file fills the rest.
+    fn settings(&self) -> Settings {
+        let require_machine_guard = if self.require_machine_guard {
+            Some(true)
+        } else if self.allow_no_machine_guard {
+            Some(false)
+        } else {
+            None
+        };
+        Settings {
+            backend: self.backend.map(BackendRequest::from),
+            memory_max: self.memory_max,
+            memory_high: self.memory_high,
+            memory_swap_max: self.memory_swap_max,
+            min_mem: self.min_mem,
+            domain_pressure: self.domain_pressure,
+            domain_pressure_for: self.domain_pressure_for,
+            job_pressure: self.job_pressure,
+            job_pressure_for: self.job_pressure_for,
+            poll: self.poll,
+            term_grace: self.term_grace,
+            require_machine_guard,
+            event_log: self.event_log.clone(),
+        }
+    }
+}
+
 fn run_guard(args: RunArgs, host: &Host) -> Result<i32> {
+    let command: Vec<String> = args
+        .command
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let profile = effective_profile(args.profile, &command, args.shim.as_deref());
+    let policy = Policy::load(&host.policy_files)?;
+    let settings = policy.resolve(&args.settings(), profile).settings;
     let job_limits = JobLimitSettings {
-        memory_max: args.memory_max,
-        memory_high: args.memory_high,
-        memory_swap_max: args.memory_swap_max,
+        memory_max: settings.memory_max,
+        memory_high: settings.memory_high,
+        memory_swap_max: settings.memory_swap_max,
     };
-    if args.backend == BackendFlag::Poll && job_limits.is_explicit() {
+    let backend = settings.backend.unwrap_or(BackendRequest::Auto);
+    if backend == BackendRequest::Poll && job_limits.is_explicit() {
         bail!(
             "--memory-max, --memory-high and --memory-swap-max need the cgroup backend; drop --backend poll"
         );
     }
-    let machine_guard = if args.require_machine_guard {
-        MachineGuardRequirement::Required
-    } else if args.allow_no_machine_guard {
-        MachineGuardRequirement::NotRequired
-    } else {
-        MachineGuardRequirement::ProfileDefault
-    };
-    let defaults = GuardPolicy::default();
-    let policy = GuardPolicy {
-        min_mem: args.min_mem.map_or(defaults.min_mem, SizeSetting::Given),
-        job_pressure: PressureLimit {
-            at_least: args.job_pressure.unwrap_or(defaults.job_pressure.at_least),
-            lasting: args
-                .job_pressure_for
-                .unwrap_or(defaults.job_pressure.lasting),
-        },
-        domain_pressure: PressureLimit {
-            at_least: args
-                .domain_pressure
-                .unwrap_or(defaults.domain_pressure.at_least),
-            lasting: args
-                .domain_pressure_for
-                .unwrap_or(defaults.domain_pressure.lasting),
-        },
-    };
     let options = RunOptions {
-        profile: args.profile,
-        policy,
+        profile,
+        shim: args.shim,
+        machine_guards: policy.machine_guards(),
+        policy: guard_policy(&settings),
         job_limits,
-        backend: args.backend.into(),
-        poll: args.poll,
-        term_grace: args.term_grace,
-        machine_guard,
-        event_log: args.event_log.unwrap_or(EventLog::Default),
+        backend,
+        poll: settings.poll.unwrap_or(DEFAULT_POLL),
+        term_grace: settings.term_grace.unwrap_or(DEFAULT_TERM_GRACE),
+        machine_guard: match settings.require_machine_guard {
+            Some(true) => MachineGuardRequirement::Required,
+            Some(false) => MachineGuardRequirement::NotRequired,
+            None => MachineGuardRequirement::ProfileDefault,
+        },
+        event_log: settings.event_log.unwrap_or(EventLog::Default),
         log_command: args.log_command,
         record_readings: args.record_readings,
         command: args.command,
     };
     supervise::run(options, host).map(|outcome| outcome.exit_code())
+}
+
+/// The stop policy: each setting that is not given takes its default.
+fn guard_policy(settings: &Settings) -> GuardPolicy {
+    let defaults = GuardPolicy::default();
+    GuardPolicy {
+        min_mem: settings
+            .min_mem
+            .map_or(defaults.min_mem, SizeSetting::Given),
+        job_pressure: PressureLimit {
+            at_least: settings
+                .job_pressure
+                .unwrap_or(defaults.job_pressure.at_least),
+            lasting: settings
+                .job_pressure_for
+                .unwrap_or(defaults.job_pressure.lasting),
+        },
+        domain_pressure: PressureLimit {
+            at_least: settings
+                .domain_pressure
+                .unwrap_or(defaults.domain_pressure.at_least),
+            lasting: settings
+                .domain_pressure_for
+                .unwrap_or(defaults.domain_pressure.lasting),
+        },
+    }
 }
 
 fn bin_dir_or_default(bin_dir: Option<PathBuf>, host: &Host) -> Result<PathBuf> {

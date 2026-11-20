@@ -23,7 +23,8 @@ use crate::host::read_rss_bytes;
 use crate::readings::{JobReadings, MemoryEvents, parse_process_group_id};
 use crate::signal::{ProcessId, group_exists, signal_group, signal_process};
 pub(crate) use checks::{
-    Manager, ScopeCgroup, Unavailable, check, check_scope, systemd_run_args, unit_name,
+    Manager, ScopeCgroup, Unavailable, check, check_scope, is_own_scope_dir, systemd_run_args,
+    unit_name,
 };
 pub(crate) use scope::{Scope, ScopeLock};
 

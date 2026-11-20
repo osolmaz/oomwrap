@@ -74,6 +74,17 @@ pub(crate) struct MemoryEvents {
     pub(crate) oom_kill: u64,
 }
 
+/// The size of a ZFS ARC from `/proc/spl/kstat/zfs/arcstats`: the third
+/// column of its `size` line.
+pub(crate) fn parse_arc_size(content: &str) -> Option<u64> {
+    content.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        (parts.next() == Some("size"))
+            .then(|| parts.nth(1)?.parse().ok())
+            .flatten()
+    })
+}
+
 /// Reads a cgroup's `memory.events`; a counter that is missing counts as 0.
 pub(crate) fn parse_memory_events(content: &str) -> Result<MemoryEvents> {
     Ok(MemoryEvents {
@@ -264,6 +275,15 @@ Hugetlb:          2048 kB
         assert!(parse_meminfo("MemAvailable: 2 kB\n").is_err());
         assert!(parse_meminfo("MemTotal: x kB\nMemAvailable: 1 kB\n").is_err());
         assert!(parse_meminfo("MemTotal: 99999999999999999 kB\nMemAvailable: 1 kB\n").is_err());
+    }
+
+    #[test]
+    fn reads_the_size_of_a_zfs_arc() {
+        let stats = "13 1 0x01 123 33456 1 2\nname type data\nhits 4 100\nsize 4 8589934592\n";
+        assert_eq!(parse_arc_size(stats), Some(8_589_934_592));
+        assert_eq!(parse_arc_size("size 4 x\n"), None);
+        assert_eq!(parse_arc_size("size\n"), None);
+        assert_eq!(parse_arc_size("c_max 4 1\n"), None);
     }
 
     #[test]

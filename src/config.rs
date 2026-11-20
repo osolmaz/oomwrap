@@ -1,10 +1,49 @@
 //! The profile table: which commands belong to which profile, and the
 //! policy that each profile carries.
 
-use std::path::Path;
+mod file;
 
+use std::fmt;
+use std::path::Path;
+use std::str::FromStr;
+
+use anyhow::bail;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+
+pub(crate) use file::{Policy, Settings, Source};
+
+/// The backend that `--backend` or the policy file asks for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackendRequest {
+    /// `cgroup` when its checks pass, `poll` otherwise.
+    Auto,
+    Cgroup,
+    Poll,
+}
+
+impl FromStr for BackendRequest {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> anyhow::Result<Self> {
+        match text {
+            "auto" => Ok(Self::Auto),
+            "cgroup" => Ok(Self::Cgroup),
+            "poll" => Ok(Self::Poll),
+            _ => bail!("unknown backend {text:?}; use auto, cgroup or poll"),
+        }
+    }
+}
+
+impl fmt::Display for BackendRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Auto => "auto",
+            Self::Cgroup => "cgroup",
+            Self::Poll => "poll",
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 pub(crate) enum Profile {
@@ -101,6 +140,15 @@ impl Profile {
             .unwrap_or_default()
     }
 
+    /// The names of `[profile.<name>]` sections: every profile but `auto`.
+    pub(crate) fn section_names() -> Vec<String> {
+        Self::value_variants()
+            .iter()
+            .filter(|profile| **profile != Self::Auto)
+            .map(|profile| profile.name())
+            .collect()
+    }
+
     pub(crate) fn requires_machine_guard(self) -> bool {
         PROFILES
             .iter()
@@ -131,11 +179,19 @@ pub(crate) fn engine_process_names() -> impl Iterator<Item = &'static str> {
         .chain(OTHER_HEAVY_PROCESSES.iter().copied())
 }
 
-pub(crate) fn effective_profile(profile: Profile, command: &[String]) -> Profile {
+/// The profile of a job: the one that `--profile` names, or the one that
+/// the command shows, or the one that the shim's tool name shows.
+pub(crate) fn effective_profile(
+    profile: Profile,
+    command: &[String],
+    shim: Option<&str>,
+) -> Profile {
     if profile != Profile::Auto {
         return profile;
     }
-    detect_profile(command).unwrap_or(Profile::Generic)
+    detect_profile(command)
+        .or_else(|| shim.and_then(|tool| detect_profile(&[tool.to_string()])))
+        .unwrap_or(Profile::Generic)
 }
 
 pub(crate) fn detect_profile(command: &[String]) -> Option<Profile> {
@@ -284,13 +340,36 @@ mod tests {
         assert_eq!(Profile::LlamaCpp.name(), "llama-cpp");
         assert_eq!(Profile::Vllm.name(), "vllm");
         assert_eq!(
-            effective_profile(Profile::Generic, &["vllm".into()]),
+            effective_profile(Profile::Generic, &["vllm".into()], None),
             Profile::Generic
         );
         assert_eq!(
-            effective_profile(Profile::Auto, &["vllm".into()]),
+            effective_profile(Profile::Auto, &["vllm".into()], None),
             Profile::Vllm
         );
+        // A wrapper runs `<path>.real`; the shim's tool name tells the rest.
+        let wrapped = ["/opt/run.real".to_string()];
+        assert_eq!(
+            effective_profile(Profile::Auto, &wrapped, Some("sglang")),
+            Profile::Sglang
+        );
+        assert_eq!(
+            effective_profile(Profile::Auto, &wrapped, Some("tool")),
+            Profile::Generic
+        );
+        assert_eq!(
+            effective_profile(Profile::Auto, &["vllm".into()], Some("sglang")),
+            Profile::Vllm
+        );
+        assert_eq!(Profile::section_names()[0], "vllm");
+        assert!(!Profile::section_names().contains(&"auto".to_string()));
+        assert_eq!(
+            "cgroup".parse::<BackendRequest>().unwrap(),
+            BackendRequest::Cgroup
+        );
+        assert_eq!(BackendRequest::Auto.to_string(), "auto");
+        assert_eq!(BackendRequest::Poll.to_string(), "poll");
+        assert!("x".parse::<BackendRequest>().is_err());
     }
 
     #[test]

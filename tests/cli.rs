@@ -149,6 +149,8 @@ impl FakeMachine {
             ("OOMWRAP_LINGER_DIR", self.file("linger")),
             ("XDG_STATE_HOME", self.state_home()),
             ("XDG_RUNTIME_DIR", self.file("runtime")),
+            ("XDG_CONFIG_HOME", self.file("config")),
+            ("OOMWRAP_SYSTEM_POLICY", self.file("etc/oomwrap.toml")),
             ("FAKE_DIR", self.dir.path().to_path_buf()),
             ("FAKE_SCOPE_PARENT", PathBuf::from(scope_parent())),
         ]
@@ -172,6 +174,22 @@ impl FakeMachine {
 
     fn cgroup_dir(&self, path: &str) -> PathBuf {
         self.file("cgroup").join(path.trim_start_matches('/'))
+    }
+
+    /// Writes the user's policy file.
+    fn policy(&self, text: &str) -> PathBuf {
+        let path = self.file("config/oomwrap/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// Writes the system policy file.
+    fn system_policy(&self, text: &str) -> PathBuf {
+        let path = self.file("etc/oomwrap.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, text).unwrap();
+        path
     }
 
     fn systemd_run_mode(&self, mode: &str) {
@@ -227,7 +245,7 @@ impl FakeMachine {
     }
 
     fn oomwrap(&self) -> Command {
-        let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+        let mut cmd = cli();
         cmd.envs(self.env());
         cmd
     }
@@ -253,6 +271,17 @@ impl FakeMachine {
             sh_quote(&oomwrap_bin())
         )
     }
+}
+
+/// `oomwrap` with its state and policy folders under the test target
+/// folder, so no test reads or writes the real home.
+fn cli() -> Command {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    cmd.env("XDG_STATE_HOME", tmp.join("state"))
+        .env("XDG_CONFIG_HOME", tmp.join("config"))
+        .env("OOMWRAP_SYSTEM_POLICY", tmp.join("no-system-policy.toml"));
+    cmd
 }
 
 fn oomwrap_bin() -> String {
@@ -301,7 +330,7 @@ fn write_executable(path: &Path, content: &str) {
 }
 
 /// Runs a shim or wrapper with `dirs` in front of `PATH`, on a fake machine
-/// with room, without a required machine-wide guard.
+/// with room and a machine-wide guard.
 fn guarded_tool(tool: &Path, dirs: &[&Path], machine: &FakeMachine) -> Command {
     let system_path = std::env::var("PATH").unwrap_or_default();
     let mut parts: Vec<String> = dirs.iter().map(|dir| dir.display().to_string()).collect();
@@ -309,7 +338,7 @@ fn guarded_tool(tool: &Path, dirs: &[&Path], machine: &FakeMachine) -> Command {
     let mut cmd = Command::new(tool);
     cmd.env("PATH", parts.join(":"))
         .envs(machine.env())
-        .env("OOMWRAP_ALLOW_NO_MACHINE_GUARD", "1");
+        .env("OOMWRAP_MACHINE_GUARD_ACTIVE", "1");
     cmd
 }
 
@@ -391,7 +420,7 @@ fn read_events(path: &Path) -> Vec<serde_json::Value> {
 
 #[test]
 fn skillflag_lists_embedded_skill() {
-    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    let mut cmd = cli();
     cmd.args(["--skill", "list", "--json"]);
     cmd.assert()
         .success()
@@ -462,8 +491,9 @@ fn doctor_and_inspect_can_emit_json() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"default_tools\""))
+        .stdout(predicate::str::contains("\"key\": \"min-mem\""))
         .stdout(predicate::str::contains(
-            "\"default_min_mem\": \"15%, at least 256M, at most 16G\"",
+            "\"value\": \"15%, at least 256M, at most 16G\"",
         ));
 }
 
@@ -475,7 +505,8 @@ fn inspect_prints_human_summary() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("oomwrap inspect"))
-        .stdout(predicate::str::contains("domain_pressure=20.00% for 10s"));
+        .stdout(predicate::str::contains("(not present)"))
+        .stdout(predicate::str::contains("backend: poll"));
 }
 
 #[test]
@@ -615,11 +646,14 @@ fn a_command_that_cannot_run_ends_as_in_a_shell() {
 }
 
 /// The one file of the default event log of `machine`.
+/// The one event log file of the day; the state folder may also hold the
+/// record of wrapped paths.
 fn default_log(machine: &FakeMachine) -> PathBuf {
     let dir = machine.state_home().join("oomwrap");
     let files: Vec<_> = fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_name().unwrap() != "wrapped-paths")
         .collect();
     assert_eq!(files.len(), 1, "{files:?}");
     let name = files[0].file_name().unwrap().to_str().unwrap().to_string();
@@ -1448,15 +1482,13 @@ fn path_shim_resolves_real_binary_without_recursing() {
         "#!/usr/bin/env bash\necho real-fake-vllm \"$@\"\n",
     );
 
-    let mut install = Command::cargo_bin("oomwrap").unwrap();
+    let mut install = cli();
     install.args([
         "install-shims",
         "--bin-dir",
         shim_dir.to_str().unwrap(),
         "--tool",
         "fake-vllm",
-        "--min-mem",
-        "1M",
     ]);
     install.assert().success();
 
@@ -1472,7 +1504,7 @@ fn path_shim_resolves_real_binary_without_recursing() {
 }
 
 #[test]
-fn path_shim_without_a_floor_leaves_it_to_run() {
+fn a_shim_takes_its_floor_from_the_policy_file() {
     // 2 GiB free is below the default floor of 2.4 GiB on the 16 GiB machine.
     let machine = FakeMachine::new(2 * KIB_PER_GIB);
     let shim_dir = machine.file("shims");
@@ -1480,10 +1512,10 @@ fn path_shim_without_a_floor_leaves_it_to_run() {
     fs::create_dir_all(&real_dir).unwrap();
     write_executable(
         &real_dir.join("fake-tool"),
-        "#!/usr/bin/env bash\necho should-not-run\n",
+        "#!/usr/bin/env bash\necho ran \"$@\"\n",
     );
 
-    let mut install = Command::cargo_bin("oomwrap").unwrap();
+    let mut install = machine.oomwrap();
     install.args([
         "install-shims",
         "--bin-dir",
@@ -1493,17 +1525,28 @@ fn path_shim_without_a_floor_leaves_it_to_run() {
     ]);
     install.assert().success();
     let script = fs::read_to_string(shim_dir.join("fake-tool")).unwrap();
-    assert!(script.contains("default_min_mem=''"), "{script}");
-    assert!(!script.contains("min-swap"), "{script}");
-
-    let mut run = guarded_tool(
-        &shim_dir.join("fake-tool"),
-        &[&shim_dir, &real_dir],
-        &machine,
+    assert!(script.contains("oomwrap script 2"), "{script}");
+    assert!(
+        script.contains(r#"run --shim "$tool" -- "$real" "$@""#),
+        "{script}"
     );
-    run.assert()
+    assert!(!script.contains("min-mem"), "{script}");
+
+    let shim = shim_dir.join("fake-tool");
+    let mut refused = guarded_tool(&shim, &[&shim_dir, &real_dir], &machine);
+    refused
+        .assert()
         .code(4)
         .stderr(predicate::str::contains("below --min-mem 2.4GiB"));
+
+    machine.policy("[profile.generic]\nmin-mem = \"1G\"\n");
+    let mut run = guarded_tool(&shim, &[&shim_dir, &real_dir], &machine);
+    run.arg("x")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ran x"));
+    let events = read_events(&default_log(&machine));
+    assert!(events.iter().all(|event| event["shim"] == "fake-tool"));
 }
 
 #[test]
@@ -1518,19 +1561,17 @@ fn path_shim_can_run_wrapped_binary_later_in_path() {
         "#!/usr/bin/env bash\necho wrapped-path-real \"$@\"\n",
     );
 
-    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
-    wrap.args(["wrap", real.to_str().unwrap(), "--min-mem", "1M"]);
+    let mut wrap = cli();
+    wrap.args(["wrap", real.to_str().unwrap()]);
     wrap.assert().success();
 
-    let mut install = Command::cargo_bin("oomwrap").unwrap();
+    let mut install = cli();
     install.args([
         "install-shims",
         "--bin-dir",
         shim_dir.to_str().unwrap(),
         "--tool",
         "vllm",
-        "--min-mem",
-        "1M",
     ]);
     install.assert().success();
 
@@ -1542,38 +1583,26 @@ fn path_shim_can_run_wrapped_binary_later_in_path() {
 }
 
 #[test]
-fn path_shim_treats_generated_defaults_as_data() {
+fn path_shim_treats_its_tool_name_as_data() {
     let machine = FakeMachine::new(ROOMY_KIB);
     let shim_dir = machine.file("shims");
-    let real_dir = machine.file("real");
-    let sentinel = machine.file("sentinel");
-    let payload = format!("$(touch {})", sentinel.display());
-    fs::create_dir_all(&real_dir).unwrap();
-    write_executable(
-        &real_dir.join("fake-vllm"),
-        "#!/usr/bin/env bash\necho should-not-run\n",
-    );
-
-    let mut install = Command::cargo_bin("oomwrap").unwrap();
+    let payload = "$(touch sentinel)";
+    let mut install = machine.oomwrap();
     install
         .arg("install-shims")
         .arg("--bin-dir")
         .arg(&shim_dir)
-        .args(["--tool", "fake-vllm", "--min-mem"])
-        .arg(&payload);
+        .args(["--tool", payload]);
     install.assert().success();
 
-    let mut run = guarded_tool(
-        &shim_dir.join("fake-vllm"),
-        &[&shim_dir, &real_dir],
-        &machine,
-    );
-    run.assert()
-        .code(2)
-        .stderr(predicate::str::contains("invalid --min-mem"));
+    let mut run = guarded_tool(&shim_dir.join(payload), &[&shim_dir], &machine);
+    run.current_dir(machine.file(""));
+    run.assert().code(127).stderr(predicate::str::contains(
+        "could not resolve real executable",
+    ));
     assert!(
-        !sentinel.exists(),
-        "generated shim default executed as shell code"
+        !machine.file("sentinel").exists(),
+        "a generated shim ran its tool name as shell code"
     );
 }
 
@@ -1582,20 +1611,14 @@ fn install_default_shims_and_refuse_unmanaged_collision() {
     let dir = tempdir().unwrap();
     let shim_dir = dir.path().join("shims");
 
-    let mut install = Command::cargo_bin("oomwrap").unwrap();
-    install.args([
-        "install-shims",
-        "--bin-dir",
-        shim_dir.to_str().unwrap(),
-        "--min-mem",
-        "1M",
-    ]);
+    let mut install = cli();
+    install.args(["install-shims", "--bin-dir", shim_dir.to_str().unwrap()]);
     install.assert().success();
     assert!(shim_dir.join("vllm").exists());
     assert!(shim_dir.join("llama-server").exists());
 
     fs::write(shim_dir.join("custom-tool"), "not managed\n").unwrap();
-    let mut collision = Command::cargo_bin("oomwrap").unwrap();
+    let mut collision = cli();
     collision.args([
         "install-shims",
         "--bin-dir",
@@ -1608,7 +1631,7 @@ fn install_default_shims_and_refuse_unmanaged_collision() {
         .code(2)
         .stderr(predicate::str::contains("refusing to replace"));
 
-    let mut uninstall = Command::cargo_bin("oomwrap").unwrap();
+    let mut uninstall = cli();
     uninstall.args([
         "uninstall-shims",
         "--bin-dir",
@@ -1635,7 +1658,7 @@ fn install_force_replaces_symlink_without_touching_target() {
     let shim = shim_dir.join("fake-vllm");
     symlink(&real, &shim).unwrap();
 
-    let mut install = Command::cargo_bin("oomwrap").unwrap();
+    let mut install = cli();
     install.args([
         "install-shims",
         "--force",
@@ -1643,8 +1666,6 @@ fn install_force_replaces_symlink_without_touching_target() {
         shim_dir.to_str().unwrap(),
         "--tool",
         "fake-vllm",
-        "--min-mem",
-        "1M",
     ]);
     install.assert().success();
 
@@ -1672,15 +1693,13 @@ fn install_refuses_dangling_symlink_without_force() {
     let shim = shim_dir.join("fake-vllm");
     symlink(dir.path().join("missing"), &shim).unwrap();
 
-    let mut install = Command::cargo_bin("oomwrap").unwrap();
+    let mut install = cli();
     install.args([
         "install-shims",
         "--bin-dir",
         shim_dir.to_str().unwrap(),
         "--tool",
         "fake-vllm",
-        "--min-mem",
-        "1M",
     ]);
     install
         .assert()
@@ -1701,15 +1720,13 @@ fn install_and_uninstall_reject_path_like_tool_names() {
     let escaped = dir.path().join("escape");
 
     for tool in ["../escape", escaped.to_str().unwrap()] {
-        let mut install = Command::cargo_bin("oomwrap").unwrap();
+        let mut install = cli();
         install.args([
             "install-shims",
             "--bin-dir",
             shim_dir.to_str().unwrap(),
             "--tool",
             tool,
-            "--min-mem",
-            "1M",
         ]);
         install
             .assert()
@@ -1718,7 +1735,7 @@ fn install_and_uninstall_reject_path_like_tool_names() {
         assert!(!escaped.exists());
     }
 
-    let mut uninstall = Command::cargo_bin("oomwrap").unwrap();
+    let mut uninstall = cli();
     uninstall.args([
         "uninstall-shims",
         "--bin-dir",
@@ -1740,11 +1757,11 @@ fn uninstall_shims_does_not_delete_absolute_wrapper() {
     let target = bin_dir.join("vllm");
     write_executable(&target, "#!/usr/bin/env bash\necho still-wrapped \"$@\"\n");
 
-    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
-    wrap.args(["wrap", target.to_str().unwrap(), "--min-mem", "1M"]);
+    let mut wrap = cli();
+    wrap.args(["wrap", target.to_str().unwrap()]);
     wrap.assert().success();
 
-    let mut uninstall = Command::cargo_bin("oomwrap").unwrap();
+    let mut uninstall = cli();
     uninstall.args([
         "uninstall-shims",
         "--bin-dir",
@@ -1771,8 +1788,8 @@ fn wrap_and_unwrap_round_trip() {
     let target = machine.file("vllm");
     write_executable(&target, "#!/usr/bin/env bash\necho wrapped-real \"$@\"\n");
 
-    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
-    wrap.args(["wrap", target.to_str().unwrap(), "--min-mem", "1M"]);
+    let mut wrap = cli();
+    wrap.args(["wrap", target.to_str().unwrap()]);
     wrap.assert().success();
     assert!(target.with_file_name("vllm.real").exists());
 
@@ -1783,7 +1800,7 @@ fn wrap_and_unwrap_round_trip() {
         .success()
         .stdout(predicate::str::contains("wrapped-real absolute"));
 
-    let mut unwrap = Command::cargo_bin("oomwrap").unwrap();
+    let mut unwrap = cli();
     unwrap.args(["unwrap", target.to_str().unwrap()]);
     unwrap.assert().success();
     assert!(!target.with_file_name("vllm.real").exists());
@@ -1804,13 +1821,13 @@ fn unwrap_restores_original_symlink_even_if_target_is_missing() {
     write_executable(&actual, "#!/usr/bin/env bash\necho actual \"$@\"\n");
     symlink(&actual, &target).unwrap();
 
-    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
-    wrap.args(["wrap", target.to_str().unwrap(), "--min-mem", "1M"]);
+    let mut wrap = cli();
+    wrap.args(["wrap", target.to_str().unwrap()]);
     wrap.assert().success();
 
     fs::remove_file(&actual).unwrap();
 
-    let mut unwrap = Command::cargo_bin("oomwrap").unwrap();
+    let mut unwrap = cli();
     unwrap.args(["unwrap", target.to_str().unwrap()]);
     unwrap.assert().success();
 
@@ -1829,8 +1846,8 @@ fn unwrap_symlink_to_wrapper_uses_wrapper_sidecar() {
     let target = real_dir.join("vllm");
     write_executable(&target, "#!/usr/bin/env bash\necho actual \"$@\"\n");
 
-    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
-    wrap.args(["wrap", target.to_str().unwrap(), "--min-mem", "1M"]);
+    let mut wrap = cli();
+    wrap.args(["wrap", target.to_str().unwrap()]);
     wrap.assert().success();
 
     let symlink_path = bin_dir.join("vllm");
@@ -1838,7 +1855,7 @@ fn unwrap_symlink_to_wrapper_uses_wrapper_sidecar() {
     symlink(&target, &symlink_path).unwrap();
     fs::write(&unrelated_sidecar, "unrelated\n").unwrap();
 
-    let mut unwrap = Command::cargo_bin("oomwrap").unwrap();
+    let mut unwrap = cli();
     unwrap.args(["unwrap", symlink_path.to_str().unwrap()]);
     unwrap.assert().success();
 
@@ -1865,8 +1882,8 @@ fn absolute_wrapper_resolves_symlink_to_real_path() {
     let target = real_dir.join("vllm");
     write_executable(&target, "#!/usr/bin/env bash\necho symlink-real \"$@\"\n");
 
-    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
-    wrap.args(["wrap", target.to_str().unwrap(), "--min-mem", "1M"]);
+    let mut wrap = cli();
+    wrap.args(["wrap", target.to_str().unwrap()]);
     wrap.assert().success();
 
     let symlink_path = bin_dir.join("vllm");
@@ -1886,14 +1903,12 @@ fn wrapped_inference_tool_still_requires_a_machine_guard() {
     let target = machine.file("vllm");
     write_executable(&target, "#!/usr/bin/env bash\necho should-not-run\n");
 
-    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
-    wrap.args(["wrap", target.to_str().unwrap(), "--min-mem", "1M"]);
+    let mut wrap = cli();
+    wrap.args(["wrap", target.to_str().unwrap()]);
     wrap.assert().success();
 
     let mut guarded = guarded_tool(&target, &[], &machine);
-    guarded
-        .env_remove("OOMWRAP_ALLOW_NO_MACHINE_GUARD")
-        .env("OOMWRAP_MACHINE_GUARD_ACTIVE", "0");
+    guarded.env("OOMWRAP_MACHINE_GUARD_ACTIVE", "0");
     guarded
         .assert()
         .code(3)
@@ -1901,33 +1916,34 @@ fn wrapped_inference_tool_still_requires_a_machine_guard() {
 }
 
 #[test]
-fn absolute_wrapper_treats_generated_defaults_as_data() {
+fn absolute_wrapper_treats_its_file_name_as_data() {
     let machine = FakeMachine::new(ROOMY_KIB);
-    let target = machine.file("vllm");
-    let sentinel = machine.file("sentinel");
-    let payload = format!("$(touch {})", sentinel.display());
-    write_executable(&target, "#!/usr/bin/env bash\necho should-not-run\n");
+    let target = machine.file("$(touch sentinel)");
+    write_executable(&target, "#!/usr/bin/env bash\necho real-ran\n");
 
-    let mut wrap = Command::cargo_bin("oomwrap").unwrap();
-    wrap.arg("wrap").arg(&target).arg("--min-mem").arg(&payload);
+    let mut wrap = machine.oomwrap();
+    wrap.arg("wrap").arg(&target);
     wrap.assert().success();
 
     let mut guarded = guarded_tool(&target, &[], &machine);
+    guarded.current_dir(machine.file(""));
     guarded
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains("invalid --min-mem"));
+        .success()
+        .stdout(predicate::str::contains("real-ran"));
     assert!(
-        !sentinel.exists(),
-        "generated wrapper default executed as shell code"
+        !machine.file("sentinel").exists(),
+        "a generated wrapper ran its file name as shell code"
     );
+    let events = read_events(&default_log(&machine));
+    assert_eq!(event(&events, "launched")["shim"], "$(touch sentinel)");
 }
 
 #[test]
 fn wrap_and_unwrap_validate_bad_inputs() {
     let dir = tempdir().unwrap();
     let missing = dir.path().join("missing");
-    let mut wrap_missing = Command::cargo_bin("oomwrap").unwrap();
+    let mut wrap_missing = cli();
     wrap_missing.args(["wrap", missing.to_str().unwrap()]);
     wrap_missing
         .assert()
@@ -1936,7 +1952,7 @@ fn wrap_and_unwrap_validate_bad_inputs() {
 
     let directory = dir.path().join("directory");
     fs::create_dir(&directory).unwrap();
-    let mut wrap_directory = Command::cargo_bin("oomwrap").unwrap();
+    let mut wrap_directory = cli();
     wrap_directory.args(["wrap", directory.to_str().unwrap()]);
     wrap_directory
         .assert()
@@ -1945,14 +1961,14 @@ fn wrap_and_unwrap_validate_bad_inputs() {
 
     let target = dir.path().join("not-executable");
     fs::write(&target, "plain text\n").unwrap();
-    let mut wrap_non_executable = Command::cargo_bin("oomwrap").unwrap();
+    let mut wrap_non_executable = cli();
     wrap_non_executable.args(["wrap", target.to_str().unwrap()]);
     wrap_non_executable
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot wrap non-executable path"));
 
-    let mut unwrap_plain = Command::cargo_bin("oomwrap").unwrap();
+    let mut unwrap_plain = cli();
     unwrap_plain.args(["unwrap", target.to_str().unwrap()]);
     unwrap_plain
         .assert()
@@ -1967,7 +1983,7 @@ fn wrap_refuses_existing_real_path_without_force() {
     write_executable(&target, "#!/usr/bin/env bash\necho target\n");
     fs::write(dir.path().join("vllm.real"), "already exists\n").unwrap();
 
-    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    let mut cmd = cli();
     cmd.args(["wrap", target.to_str().unwrap()]);
     cmd.assert()
         .code(2)
@@ -1981,7 +1997,7 @@ fn wrap_refuses_dangling_real_sidecar_without_force() {
     write_executable(&target, "#!/usr/bin/env bash\necho target\n");
     symlink(dir.path().join("missing"), dir.path().join("vllm.real")).unwrap();
 
-    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    let mut cmd = cli();
     cmd.args(["wrap", target.to_str().unwrap()]);
     cmd.assert()
         .code(2)
@@ -2341,4 +2357,178 @@ fn the_holder_of_a_scope_stays_until_the_guard_releases_its_lock() {
         .timeout(Duration::from_secs(5))
         .assert()
         .success();
+}
+
+#[test]
+fn the_policy_file_sets_what_the_flags_leave_open() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let system = machine.system_policy("min-mem = \"12G\"\n");
+    let mut refused = machine.run();
+    refused.args(["--", "true"]);
+    refused
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("below --min-mem 12.0GiB"));
+
+    // The user's file comes before the system's, a flag before both.
+    machine.policy("min-mem = \"1G\"\n");
+    machine.run().args(["--", "true"]).assert().success();
+    let mut flag = machine.run();
+    flag.args(["--min-mem", "11G", "--", "true"]);
+    flag.assert().code(4);
+
+    let mut contradiction = machine.run();
+    machine.policy("backend = \"poll\"\n");
+    contradiction.args(["--memory-max", "1G", "--", "true"]);
+    contradiction
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("drop --backend poll"));
+
+    fs::write(&system, "min-swap = \"1G\"\n").unwrap();
+    let mut invalid = machine.run();
+    invalid.args(["--", "true"]);
+    invalid
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(format!(
+            "invalid policy file {}: unknown field `min-swap`",
+            system.display()
+        )));
+}
+
+#[test]
+fn a_profile_section_can_lift_the_guard_requirement() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let mut vllm = machine.oomwrap();
+    vllm.env("OOMWRAP_MACHINE_GUARD_ACTIVE", "0")
+        .args(["run", "--profile", "vllm", "--", "true"]);
+    vllm.assert().code(3);
+    machine.policy("[profile.vllm]\nrequire-machine-guard = false\n");
+    let mut lifted = machine.oomwrap();
+    lifted.env("OOMWRAP_MACHINE_GUARD_ACTIVE", "0").args([
+        "run",
+        "--profile",
+        "vllm",
+        "--",
+        "true",
+    ]);
+    lifted.assert().success();
+}
+
+#[test]
+fn a_guard_that_the_policy_file_names_counts() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let name = format!("oomwrap-test-guard-{}", std::process::id());
+    // The test's own child, which only the test ends.
+    let mut guard = Command::new("bash")
+        .args(["-c", &format!("exec -a {name} sleep 30")])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    machine.policy(&format!("machine-guards = [\"{name}\"]\n"));
+    let mut vllm = machine.oomwrap();
+    vllm.args(["run", "--profile", "vllm", "--", "true"]);
+    let status = vllm.output().unwrap().status;
+    guard.kill().unwrap();
+    guard.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+}
+
+#[test]
+fn doctor_names_each_setting_its_source_and_outdated_scripts() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let policy = machine.policy("poll = \"2s\"\n[profile.generic]\nmin-mem = \"1G\"\n");
+    let bin = machine.file("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_executable(
+        &bin.join("vllm"),
+        "#!/usr/bin/env bash\n# oomwrap managed path shim\nexec oomwrap run --min-swap 4G -- \"$real\"\n",
+    );
+    let mut doctor = machine.oomwrap();
+    doctor.env("PATH", &bin).arg("doctor");
+    let output = doctor.assert().success().get_output().stdout.clone();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("settings for profile generic:"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "min-mem: 1G ({} [profile.generic])",
+            policy.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("poll: 2s ({})", policy.display())),
+        "{text}"
+    );
+    assert!(text.contains("term-grace: 10s (default)"), "{text}");
+    assert!(text.contains("backend: poll (auto took poll: "), "{text}");
+    assert!(
+        text.contains(&format!(
+            "comes from an earlier oomwrap and passes flags that this version does not have; write it again: oomwrap install-shims --bin-dir '{}' --tool 'vllm'",
+            bin.display()
+        )),
+        "{text}"
+    );
+
+    let mut json = machine.oomwrap();
+    json.env("PATH", &bin)
+        .args(["doctor", "--json", "--profile", "vllm"]);
+    let output = json.assert().success().get_output().stdout.clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["profile"], "vllm");
+    assert_eq!(report["scripts"][0]["kind"], "path_shim");
+    assert_eq!(report["scripts"][0]["outdated"], true);
+    let min_mem = report["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|setting| setting["key"] == "min-mem")
+        .unwrap();
+    assert_eq!(min_mem["source"]["kind"], "default");
+}
+
+#[test]
+fn wrap_rewrites_an_old_wrapper_in_place_and_records_it() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let target = machine.file("tool");
+    write_executable(
+        &target.with_file_name("tool.real"),
+        "#!/usr/bin/env bash\necho real\n",
+    );
+    // A wrapper of an earlier version, with its own flags.
+    write_executable(
+        &target,
+        "#!/usr/bin/env bash\n# oomwrap managed absolute wrapper\nexec oomwrap run --min-swap 4G -- \"$0.real\"\n",
+    );
+    let mut wrap = machine.oomwrap();
+    wrap.arg("wrap").arg(&target);
+    wrap.assert()
+        .success()
+        .stdout(predicate::str::contains("rewrote wrapper"));
+    let script = fs::read_to_string(&target).unwrap();
+    assert!(script.contains("oomwrap script 2"), "{script}");
+    let record = machine.state_home().join("oomwrap/wrapped-paths");
+    assert_eq!(
+        fs::read_to_string(&record).unwrap(),
+        format!("{}\n", target.display())
+    );
+    guarded_tool(&target, &[], &machine)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("real"));
+
+    let mut doctor = machine.oomwrap();
+    doctor
+        .env("PATH", machine.file("none"))
+        .args(["doctor", "--json"]);
+    let output = doctor.assert().success().get_output().stdout.clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["scripts"][0]["kind"], "wrapper");
+    assert_eq!(report["scripts"][0]["outdated"], false);
+
+    let mut unwrap = machine.oomwrap();
+    unwrap.arg("unwrap").arg(&target);
+    unwrap.assert().success();
+    assert_eq!(fs::read_to_string(&record).unwrap(), "");
 }

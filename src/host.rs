@@ -27,6 +27,8 @@ const MACHINE_GUARD_VAR: &str = "OOMWRAP_MACHINE_GUARD_ACTIVE";
 const SYSTEMD_RUN_VAR: &str = "OOMWRAP_SYSTEMD_RUN";
 /// Test seam: the folder of the users with lingering on.
 const LINGER_DIR_VAR: &str = "OOMWRAP_LINGER_DIR";
+/// Test seam: the system policy file, `/etc/oomwrap.toml` outside tests.
+const SYSTEM_POLICY_VAR: &str = "OOMWRAP_SYSTEM_POLICY";
 /// The page size when `sysconf` cannot tell it.
 const FALLBACK_PAGE_SIZE: u64 = 4096;
 
@@ -40,6 +42,8 @@ pub(crate) struct Host {
     /// oomwrap runs in a container, where a guard of the host is not visible.
     pub(crate) in_container: bool,
     pub(crate) home: Option<PathBuf>,
+    /// The folders of `PATH`, where `doctor` looks for shims.
+    pub(crate) path_dirs: Vec<PathBuf>,
     /// `XDG_STATE_HOME`, the folder of the default event log.
     pub(crate) state_home: Option<PathBuf>,
     /// `XDG_RUNTIME_DIR`, where the control socket of a launch goes.
@@ -57,6 +61,8 @@ pub(crate) struct Host {
     pub(crate) is_root: bool,
     /// The page size, which is not 4 KiB on every machine.
     pub(crate) page_size: u64,
+    /// The policy files, system first, then the user's.
+    pub(crate) policy_files: Vec<PathBuf>,
 }
 
 impl Host {
@@ -78,6 +84,9 @@ impl Host {
                 || Path::new("/.dockerenv").exists()
                 || Path::new("/run/.containerenv").exists(),
             home: env::var_os("HOME").map(PathBuf::from),
+            path_dirs: env::var_os("PATH")
+                .map(|path| env::split_paths(&path).collect())
+                .unwrap_or_default(),
             state_home: absolute_path_var("XDG_STATE_HOME"),
             runtime_dir: absolute_path_var("XDG_RUNTIME_DIR"),
             temp_dir: env::temp_dir(),
@@ -99,6 +108,7 @@ impl Host {
                 .and_then(|size| u64::try_from(size).ok())
                 .filter(|size| *size > 0)
                 .unwrap_or(FALLBACK_PAGE_SIZE),
+            policy_files: policy_files(),
         }
     }
 
@@ -167,8 +177,13 @@ impl Host {
             .ok_or_else(|| anyhow!("HOME is not set"))
     }
 
-    /// Finds the machine-wide guards that watch a job in `job_cgroup`.
-    pub(crate) fn machine_guards(&self, job_cgroup: Option<&str>) -> Result<Vec<MachineGuard>> {
+    /// Finds the machine-wide guards that watch a job in `job_cgroup`, with
+    /// the extra guards that the policy file names.
+    pub(crate) fn machine_guards(
+        &self,
+        job_cgroup: Option<&str>,
+        declared: &[String],
+    ) -> Result<Vec<MachineGuard>> {
         if let Some(active) = self.machine_guard_override {
             return Ok(if active {
                 vec![MachineGuard::Declared("test".to_string())]
@@ -187,6 +202,11 @@ impl Host {
         {
             guards.push(MachineGuard::SystemdOomd);
         }
+        for name in declared {
+            if runs_program(&processes, own_pid, name) {
+                guards.push(MachineGuard::Declared(name.clone()));
+            }
+        }
         Ok(guards)
     }
 }
@@ -200,6 +220,19 @@ pub(crate) enum MachineGuard {
     SystemdOomd,
     /// A guard that the configuration names by its process name.
     Declared(String),
+}
+
+/// `/etc/oomwrap.toml`, then `${XDG_CONFIG_HOME:-~/.config}/oomwrap/config.toml`.
+// Thin environment adapter; tests set the variables.
+#[cfg_attr(test, mutants::skip)]
+fn policy_files() -> Vec<PathBuf> {
+    let system = env::var_os(SYSTEM_POLICY_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/oomwrap.toml"));
+    let config_home = absolute_path_var("XDG_CONFIG_HOME")
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    let user = config_home.map(|dir| dir.join("oomwrap/config.toml"));
+    std::iter::once(system).chain(user).collect()
 }
 
 /// An environment variable that names an absolute path; the XDG rules
@@ -429,6 +462,7 @@ pub(crate) mod tests {
                 machine_guard_override: Some(false),
                 in_container: false,
                 home: None,
+                path_dirs: Vec::new(),
                 state_home: None,
                 runtime_dir: None,
                 temp_dir: self.dir.path().to_path_buf(),
@@ -438,6 +472,7 @@ pub(crate) mod tests {
                 user_name: Some("user".to_string()),
                 is_root: false,
                 page_size: 4096,
+                policy_files: Vec::new(),
             }
         }
 
@@ -539,9 +574,9 @@ pub(crate) mod tests {
     fn the_guard_override_decides_alone() {
         let fake = FakeHost::new();
         let mut host = fake.host();
-        assert!(host.machine_guards(None).unwrap().is_empty());
+        assert!(host.machine_guards(None, &[]).unwrap().is_empty());
         host.machine_guard_override = Some(true);
-        assert_eq!(host.machine_guards(None).unwrap().len(), 1);
+        assert_eq!(host.machine_guards(None, &[]).unwrap().len(), 1);
     }
 
     #[test]

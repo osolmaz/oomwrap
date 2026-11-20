@@ -18,7 +18,7 @@ use crate::backend::{
     Backend, BackendKind, LeaderExit, LeaderState, Manager, ProcessGroup, SIGNAL_EXIT_BASE, Scope,
     ScopeCgroup, ScopeLock, Unavailable, check, check_scope, systemd_run_args, unit_name,
 };
-use crate::config::{Profile, effective_profile};
+use crate::config::{BackendRequest, Profile};
 use crate::domain::{Domain, MemoryDomain};
 use crate::events::{
     EventKind, EventLog, EventLogger, EventReason, RunContext, TraceWriter, program_name,
@@ -51,17 +51,13 @@ pub(crate) enum MachineGuardRequirement {
     NotRequired,
 }
 
-/// The backend that `--backend` asks for.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendRequest {
-    /// `cgroup` when its checks pass, `poll` otherwise.
-    Auto,
-    Cgroup,
-    Poll,
-}
-
 pub(crate) struct RunOptions {
+    /// The profile of the job, already detected from the command.
     pub(crate) profile: Profile,
+    /// The tool whose shim or wrapper started the run.
+    pub(crate) shim: Option<String>,
+    /// Extra machine-wide guards that the policy file names.
+    pub(crate) machine_guards: Vec<String>,
     pub(crate) policy: GuardPolicy,
     pub(crate) job_limits: JobLimitSettings,
     pub(crate) backend: BackendRequest,
@@ -125,7 +121,7 @@ impl Outcome {
 
 /// The backend that a run starts with.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Plan {
+pub(crate) enum Plan {
     Cgroup(Manager),
     /// `why` says why `auto` did not take `cgroup`.
     Poll {
@@ -136,7 +132,11 @@ enum Plan {
 /// `--backend auto` takes `cgroup` when its checks pass. When they fail,
 /// it takes `poll`, unless a job limit was asked for, which only a scope
 /// can hold.
-fn choose_plan(request: BackendRequest, explicit: bool, host: &Host) -> Result<Plan, Unavailable> {
+pub(crate) fn choose_plan(
+    request: BackendRequest,
+    explicit: bool,
+    host: &Host,
+) -> Result<Plan, Unavailable> {
     if request == BackendRequest::Poll {
         return Ok(Plan::Poll { why: None });
     }
@@ -150,7 +150,7 @@ fn choose_plan(request: BackendRequest, explicit: bool, host: &Host) -> Result<P
     }
 }
 
-fn unavailable_message(unavailable: &Unavailable, request: BackendRequest) -> String {
+pub(crate) fn unavailable_message(unavailable: &Unavailable, request: BackendRequest) -> String {
     let need = if request == BackendRequest::Cgroup {
         "--backend cgroup needs it"
     } else {
@@ -205,7 +205,7 @@ struct ScopeStart {
 
 pub(crate) fn run(options: RunOptions, host: &Host) -> Result<Outcome> {
     let command = command_strings(&options.command);
-    let profile = effective_profile(options.profile, &command);
+    let profile = options.profile;
     let plan = choose_plan(options.backend, options.job_limits.is_explicit(), host);
     let job_cgroup = match &plan {
         Ok(Plan::Cgroup(manager)) => Some(manager.scope_parent()),
@@ -223,6 +223,7 @@ pub(crate) fn run(options: RunOptions, host: &Host) -> Result<Outcome> {
         pid: None,
         unit: None,
         cgroup: None,
+        shim: options.shim.clone(),
     };
     let mut run = Supervisor {
         terminal: None,
@@ -240,7 +241,9 @@ pub(crate) fn run(options: RunOptions, host: &Host) -> Result<Outcome> {
         }
     };
     if needs_machine_guard(options.machine_guard, profile)
-        && host.machine_guards(job_cgroup.as_deref())?.is_empty()
+        && host
+            .machine_guards(job_cgroup.as_deref(), &options.machine_guards)?
+            .is_empty()
     {
         let message = missing_guard_message(profile, host.in_container);
         return run.refuse(Refusal::NoMachineGuard, &message);
