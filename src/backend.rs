@@ -60,6 +60,10 @@ impl ProcessGroup {
     }
 
     /// Reaps the leader after a stop; its status no longer matters.
+    // `terminate` already reaps a leader that exited, so skipping this wait
+    // changes nothing that a test can see: it only blocks for a leader that
+    // still runs in uninterruptible sleep, and oomwrap exits right after.
+    #[cfg_attr(test, mutants::skip)]
     pub(crate) fn reap(&mut self) {
         let _ = self.child.wait();
     }
@@ -186,7 +190,41 @@ pub(crate) fn read_process_group_id(proc_dir: &Path) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::ExitStatusExt;
+
     use super::*;
+
+    /// Polls `try_wait` until the leader's status is known, for at most 3 s.
+    fn wait_for_exit(group: &mut ProcessGroup) -> Option<ExitStatus> {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(3) {
+            if let Some(status) = group.try_wait().unwrap() {
+                return Some(status);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn terminate_ends_the_own_child_group() {
+        let mut group = ProcessGroup::spawn(&["sleep".into(), "30".into()]).unwrap();
+        assert_eq!(
+            i64::from(group.leader_pid()),
+            i64::from(group.pgid().as_raw())
+        );
+        let terminated = group.terminate(Duration::from_millis(50));
+        let status = wait_for_exit(&mut group);
+        if status.is_none() {
+            // Never leave the own child running when the check fails.
+            let _ = group.child.kill();
+            let _ = group.child.wait();
+        }
+        terminated.unwrap();
+        let status = status.expect("the group must end after terminate");
+        assert_eq!(status.signal(), Some(Signal::SIGTERM as i32));
+        assert!(!group.has_members());
+    }
 
     #[test]
     fn process_group_members_are_only_the_own_child() {

@@ -251,6 +251,20 @@ mod tests {
     }
 
     #[test]
+    fn python_executables_are_python_with_a_version() {
+        for name in ["python", "python3", "python3.12"] {
+            assert!(is_python_executable(name), "{name} is Python");
+        }
+        for name in ["node", "python3x", "pythonw", "py"] {
+            assert!(!is_python_executable(name), "{name} is not Python");
+        }
+        assert_eq!(
+            detect_profile(&["node".into(), "-m".into(), "vllm".into()]),
+            None
+        );
+    }
+
+    #[test]
     fn profile_requirements_are_conservative() {
         assert!(Profile::Vllm.requires_earlyoom());
         assert!(Profile::LlamaCpp.requires_earlyoom());
