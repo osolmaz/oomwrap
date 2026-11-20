@@ -1,0 +1,61 @@
+name: Real system
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # tests/real_system.rs on throwaway GitHub-hosted runners. Its jobs run out
+  # of memory on purpose, each in a small scope of its own. Ubuntu 22.04 has
+  # systemd 249, Ubuntu 24.04 systemd 255.
+  host:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-22.04-arm
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: .github/scripts/build-suite.sh "$RUNNER_TEMP/suite"
+      - name: Start a user manager
+        run: .github/scripts/start-user-manager.sh
+      - name: Real-system suite
+        env:
+          OOMWRAP_REAL_SYSTEM: host
+        run: OOMWRAP_TEST_BIN="$RUNNER_TEMP/suite/oomwrap" "$RUNNER_TEMP/suite/real_system"
+
+  # The poll backend and the cgroup domain, in a container with a memory limit
+  # and no service manager.
+  container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: .github/scripts/build-suite.sh "$RUNNER_TEMP/suite"
+      - name: Real-system suite in a container
+        run: |
+          docker run --rm --memory 768m --memory-swap 768m \
+            --volume "$RUNNER_TEMP/suite:/opt/suite:ro" \
+            --env OOMWRAP_REAL_SYSTEM=container \
+            --env OOMWRAP_TEST_BIN=/opt/suite/oomwrap \
+            ubuntu:24.04 /opt/suite/real_system

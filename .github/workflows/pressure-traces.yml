@@ -1,0 +1,46 @@
+name: Pressure traces
+
+# Started by hand: a manual dispatch, or a push to a `traces/` branch (a
+# dispatch needs the workflow on the default branch). It records traces on
+# throwaway runners and brings one of them itself under memory pressure, the
+# only place where anything puts a whole machine under pressure. The traces
+# go into tests/fixtures/traces after a review.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "traces/**"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  record:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: .github/scripts/build-suite.sh "$RUNNER_TEMP/suite" --release
+      - name: Start a user manager
+        run: .github/scripts/start-user-manager.sh
+      - name: Record
+        run: .github/scripts/record-traces.sh "$RUNNER_TEMP/suite" traces
+      - name: Keep the traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traces-${{ matrix.arch }}
+          path: traces
