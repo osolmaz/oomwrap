@@ -262,10 +262,15 @@ pub(crate) const DEFAULT_JOB_PRESSURE: PressureLimit = PressureLimit {
 };
 
 /// Lower and shorter than the job's, because 60% for 30 s at the root of a
-/// machine is already a frozen desktop. Provisional until the machine
-/// pressure traces of phase 6.
+/// machine is already a frozen desktop. Set from the machine pressure
+/// traces of phase 6 (`tests/fixtures/traces`): a machine that thrashed at
+/// 1% free room read 8% to 22% on x86_64 and 12% to 33% on aarch64, so 20%
+/// missed the x86_64 run; a build, a renderer and a model load read 0%.
+/// The pressure of a domain counts only while the domain is short of
+/// memory, which keeps a lower limit from stopping jobs on a machine with
+/// room.
 pub(crate) const DEFAULT_DOMAIN_PRESSURE: PressureLimit = PressureLimit {
-    at_least: Pressure(20 * 100),
+    at_least: Pressure(10 * 100),
     lasting: Duration::from_secs(10),
 };
 
@@ -469,7 +474,7 @@ mod tests {
         assert_eq!(limits.job_pressure, DEFAULT_JOB_PRESSURE);
         assert_eq!(limits.domain_pressure, DEFAULT_DOMAIN_PRESSURE);
         assert_eq!(DEFAULT_JOB_PRESSURE.at_least.hundredths(), 6000);
-        assert_eq!(DEFAULT_DOMAIN_PRESSURE.at_least.hundredths(), 2000);
+        assert_eq!(DEFAULT_DOMAIN_PRESSURE.at_least.hundredths(), 1000);
         // The bounds keep a floor on a small board and cap it on a large server.
         assert_eq!(
             policy.resolve(GIB).unwrap().min_free_bytes,
@@ -522,7 +527,7 @@ mod tests {
         let limits = GuardPolicy::default().resolve(16 * GIB).unwrap();
         let value = serde_json::to_value(limits).unwrap();
         assert_eq!(value["min_free_bytes"], 16 * GIB * 15 / 100);
-        assert_eq!(value["domain_pressure"]["at_least"], 20.0);
+        assert_eq!(value["domain_pressure"]["at_least"], 10.0);
         assert_eq!(value["domain_pressure"]["for_ms"], 10_000);
         assert_eq!(value["job_pressure"]["for_ms"], 30_000);
         let huge = PressureLimit {

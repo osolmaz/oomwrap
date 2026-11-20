@@ -36,7 +36,21 @@ to the repository or release files.
    Mutation tests are optional and are not part of a release. The `mutants`
    job of CI runs only on a manual dispatch with the `mutants` input, for a
    run that the maintainer asks for.
-5. Merge or push the release commit to `main` and wait for CI to pass.
+5. Merge or push the release commit to `main` and wait for the `CI` and
+   `Real system` workflows to pass.
+
+## Real-system checks
+
+The `Real system` workflow runs `tests/real_system.rs` on throwaway
+GitHub-hosted runners: Ubuntu 22.04 (systemd 249) and Ubuntu 24.04 (systemd
+255), each on `x86_64` and `aarch64`, and a container with a memory limit and
+no service manager. Its jobs run out of memory on purpose, each in a small
+scope of its own. Kernels before Linux 5.14, cgroup v1 and hybrid hosts have no
+hosted runner; only the fake trees of `tests/cli.rs` cover them.
+
+The `Pressure traces` workflow, started by hand, records traces and brings one
+runner itself under memory pressure. Review its traces before they go into
+`tests/fixtures/traces`, and add each one with its decision to `traces.toml`.
 
 ## Publish
 

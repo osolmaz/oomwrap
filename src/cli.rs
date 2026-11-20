@@ -132,7 +132,7 @@ struct RunArgs {
     #[arg(long)]
     min_mem: Option<Size>,
 
-    /// PSI `full avg10` limit of the memory domain [default: 20%]
+    /// PSI `full avg10` limit of the memory domain, while it is short of memory [default: 10%]
     #[arg(long)]
     domain_pressure: Option<Pressure>,
 
@@ -391,6 +391,38 @@ fn error_chain(error: &(dyn StdError + 'static)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The help text of the pressure flags names the defaults that apply.
+    #[test]
+    fn the_help_names_the_default_pressures() {
+        use crate::limits::{DEFAULT_DOMAIN_PRESSURE, DEFAULT_JOB_PRESSURE, PressureLimit};
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let run = command.find_subcommand("run").unwrap();
+        let help = |id: &str| {
+            let arg = run.get_arguments().find(|arg| arg.get_id() == id).unwrap();
+            arg.get_help().unwrap().to_string()
+        };
+        let percent =
+            |limit: PressureLimit| format!("[default: {}%]", limit.at_least.hundredths() / 100);
+        let seconds = |limit: PressureLimit| format!("[default: {}s]", limit.lasting.as_secs());
+        for (flag, limit) in [
+            ("domain_pressure", DEFAULT_DOMAIN_PRESSURE),
+            ("job_pressure", DEFAULT_JOB_PRESSURE),
+        ] {
+            assert!(
+                help(flag).ends_with(&percent(limit)),
+                "{flag}: {}",
+                help(flag)
+            );
+            let lasting = format!("{flag}_for");
+            assert!(
+                help(&lasting).ends_with(&seconds(limit)),
+                "{lasting}: {}",
+                help(&lasting)
+            );
+        }
+    }
 
     #[test]
     fn invalid_values_name_the_flag_and_the_cause() {

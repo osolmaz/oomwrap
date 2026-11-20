@@ -206,7 +206,7 @@ A size is bytes with a binary unit (`512M`, `24G`), a share of the domain's size
 | `--memory-swap-max` | not set | The job's own swap (`memory.swap.max`). Not set, the kernel's normal swap behavior applies |
 | `--min-mem` | `15%`, at least `256M`, at most `16G` | Floor for the domain's free room |
 | `--job-pressure`, `--job-pressure-for` | `60%`, `30s` | PSI `full avg10` limit of the job's cgroup, and how long it must last |
-| `--domain-pressure`, `--domain-pressure-for` | `20%`, `10s` (provisional) | PSI `full avg10` limit of the domain, and how long it must last |
+| `--domain-pressure`, `--domain-pressure-for` | `10%`, `10s` | PSI `full avg10` limit of the domain while it is short of memory, and how long it must last |
 
 Why these defaults:
 
@@ -223,8 +223,11 @@ Why these defaults:
 - **Job pressure** uses the published defaults of `systemd-oomd` (`DefaultMemoryPressureLimit=60%`,
   `DefaultMemoryPressureDurationSec=30s`), which apply to one unit's cgroup, as a job is.
 - **Domain pressure** is lower and shorter, because `60%` for `30s` at the root of a machine is
-  already a frozen desktop. The value is provisional until phase 6 records real machine pressure on
-  throwaway virtual machines.
+  already a frozen desktop. Phase 6 set it from machine pressure traces of throwaway runners: a
+  machine that thrashed at 1% free room read 8% to 22% on `x86_64` and 12% to 33% on `aarch64`, so
+  the first value, `20%`, never stopped the `x86_64` run; a build, a renderer and a model load read
+  0%. `10%` for `10s` stops both thrashing runs about 10 s after the thrash starts (see
+  [Results of phase 6](#results-of-phase-6)).
 
 When only one of `--memory-high` and `--memory-max` is given, the other follows by the default
 ratio. An explicit `--memory-max` is used as given, also above the launch-time cap; preflight still
@@ -243,7 +246,7 @@ One pure function decides:
 | `job_limit` | `oom` in the job's `memory.events` rose: the job reached `memory.max` | `cgroup` |
 | `outside_oom_kill` | `oom_kill` rose without `oom`: an out-of-memory killer outside the job's limit killed a job process | `cgroup` |
 | `job_pressure` | The job's `full avg10` stayed at or above `--job-pressure` for `--job-pressure-for` | `cgroup` |
-| `domain_pressure` | The domain's `full avg10` stayed at or above `--domain-pressure` for `--domain-pressure-for` | both |
+| `domain_pressure` | The domain is short of memory, and its `full avg10` stayed at or above `--domain-pressure` for `--domain-pressure-for` | both |
 | `domain_floor` | The domain's free room fell below `--min-mem` | both |
 
 oomwrap reads `memory.events` again after the main process exits, so a job that ended by `SIGKILL`
@@ -252,6 +255,16 @@ at its limit is reported as `job_limit` and not as the command's own exit.
 Free swap is no stop condition. A full swap with free room in the domain is no danger, and low free
 room already stops the job through `domain_floor`. Where the kernel has no PSI (before Linux 4.20,
 or with PSI turned off), the pressure conditions are off and `doctor` says so.
+
+**A domain short of memory.** The pressure of a domain counts only while its free room is below a
+quarter of its size. With more room free, the pressure comes from a limit inside the domain, such
+as one job at its own `memory.max`, and that job's own guard handles it with `job_limit` and
+`job_pressure`. The system-wide PSI says only that every running task stalled: on a quiet
+machine, one job that stalls at its own limit is every running task. (Phase 6 added this rule. On
+the CI runners, a job at its own `64M` limit made the machine read 71% with 94% of its memory
+free, so every guard of the machine would have stopped its job for `domain_pressure`, and the
+preflight refused new launches for as long as the reading took to decay. In the machine pressure
+traces, real pressure rose only below 2% of free room.)
 
 The kernel counts the time it throttles a job above `memory.high` as memory stall of that job. A job
 that stays far above `memory.high` can therefore meet `job_pressure`. That is intended:
@@ -266,12 +279,14 @@ its `memory.current`; a `poll` job's use is the sum of the resident memory of it
 (phase 4), and a job whose use is unknown waits the full 2 s. On a shared machine, guarded jobs still stop for memory that other users' work
 takes: the guard protects the machine, not the job.
 
-Preflight refuses a launch (exit 4) when `domain_floor` or `domain_pressure` already holds.
+Preflight refuses a launch (exit 4) when `domain_floor` or `domain_pressure` already holds, the
+latter only on a domain short of memory.
 
 Memory that a device driver allocates for the job can sit outside these readings. On a machine with
-unified GPU memory, a model's GPU allocations come from system RAM, and the memory controller may
-not charge them to the job's cgroup. `domain_pressure` and `domain_floor` still see that memory on
-a machine domain. Phase 6 measures whether the cgroup charges it, and step 12 of
+unified GPU memory, a model's GPU allocations come from system RAM, and the memory controller does
+not charge them to the job's cgroup: phase 6 measured 1,672 MiB on the GPU and 596 MiB in the job's
+`memory.current` (see [Results of phase 6](#results-of-phase-6)). `--memory-max` does not bound that
+memory. `domain_pressure` and `domain_floor` still see it on a machine domain, and step 12 of
 [The end state](#the-end-state) counts it in the job.
 
 ### Machine-wide guard
@@ -504,30 +519,49 @@ Smells of 0.1.0 that the split removes:
   default event log holds no arguments and that concurrent writers never mix lines; and read
   `/proc/<child>/oom_score_adj` and expect `1000`. The `poll` backend runs for real.
 - **Replay of recorded runs, in CI:** traces from `--record-readings`, with a generic job label
-  (`build`, `renderer`, `model load`) and no command line, host name or path, stored under
-  `tests/fixtures/traces/` with the decision that each run must get. CI replays every trace through
-  `policy`, so each change of the policy or of a default is checked against real history and not
-  only against made-up numbers.
-- **Real system, in CI on throwaway runners:** a helper binary under `tests/`, run on GitHub-hosted
-  runners with lingering turned on for the runner user: Ubuntu 22.04 (systemd 249, below 253) and
-  Ubuntu 24.04, each on `x86_64` and `aarch64`, and one container job for the `poll` backend and the
-  cgroup domain. It
-  - allocates past a `64M` `--memory-max`: `job_limit`, exit 137, no process left;
+  (`build`, `renderer`, `model load`, `memory ramp`, `machine pressure`) and no command line, host
+  name or path, stored under `tests/fixtures/traces/` as recorded. `traces.toml` names the decision
+  that each run must get, also without the floor (`min-mem = "0"`, to see the pressure stops alone),
+  and for a stop the seconds in which it must come. A unit test (`policy/replay`) replays every trace
+  through `policy`, so each change of the policy or of a default is checked against real history and
+  not only against made-up numbers. The replay leaves out the short wait before a domain stop.
+- **Real system, in CI on throwaway runners:** `tests/real_system.rs`, a test target with its own
+  `main` that is also the helper its jobs run, in the `Real system` workflow on GitHub-hosted
+  runners with lingering turned on for the runner user and the memory controller delegated to the
+  user manager: Ubuntu 22.04 (systemd 249, below 253) and Ubuntu 24.04, each on `x86_64` and
+  `aarch64`, and one container job for the `poll` backend and the cgroup domain (`docker run` with
+  768 MiB and no swap, because a container step of the workflow would build inside the limit). It
+  runs only when `OOMWRAP_REAL_SYSTEM` names a suite, and `OOMWRAP_TEST_BIN` names another binary to
+  test, such as a release build. It
+  - allocates past a `64M` `--memory-max`: exit 137, no process left. Linux 7.0 kills the job at the
+    limit within seconds (`job_limit`); Linux 6.8 let it stall at the limit for more than 90 s
+    without a kill, and the default `job_pressure` ends it (phase 6 found this; the first text
+    expected `job_limit` everywhere);
   - forks a child that calls `setsid()` and sleeps: the stop ends both;
   - runs at a `memory-high` far below its working set: `job_pressure`;
   - checks that the environment, the working folder, the exit code and a forwarded signal pass
     through `systemd-run` unchanged, that the control socket reaches `exec-job` but not the command,
-    and that `/proc/<guard pid>/exe` runs after the oomwrap file was replaced;
+    and that `/proc/<guard pid>/exe` runs after the oomwrap file was replaced. The one variable that
+    changes is `INVOCATION_ID`, which systemd sets for each unit, also for the scope;
   - runs inside a scope that has its own `MemoryMax`: `auto` takes `poll` with that cgroup as the
-    domain.
+    domain;
+  - measures the time of a run of `true` with each backend;
+  - in the container, fills 400 MiB of file cache and then takes the free room that oomwrap reports,
+    which counts inactive file pages: the kernel must give that room back without a kill.
 
   Only the job's own small scope runs out of memory; the runner itself never comes under pressure.
   Kernels before 5.14, cgroup v1 and hybrid hosts have no hosted runner and are covered only by the
   fake trees; the plan says so in `RELEASING.md`.
-- **Machine pressure traces:** a separate workflow, started by hand, brings a throwaway runner
-  virtual machine itself under memory pressure and records its readings as traces, for the replay
-  tests and for the `domain_pressure` default. This is the only place where anything puts a whole
-  machine under pressure, because the machine is discarded after the run.
+- **Machine pressure traces:** a separate workflow, `Pressure traces`, started by hand, brings a
+  throwaway runner virtual machine itself under memory pressure and records its readings as traces,
+  for the replay tests and for the `domain_pressure` default. This is the only place where anything
+  puts a whole machine under pressure, because the machine is discarded after the run. It starts on
+  a manual dispatch or on a push to a `traces/` branch, because a dispatch needs the workflow on the
+  default branch. On each architecture it records a release build of this crate, a headless browser
+  that draws 48 large canvases (`x86_64`, where the runner image has the browser), a job that writes
+  to 2 GiB under `--memory-high 1G`, and a job that takes the free room plus 1 GiB and then writes to
+  all of it for 60 s. The two ramps run with stop limits that never hold, so the trace covers the
+  whole run. New traces go into `tests/fixtures/traces` after a review.
 
 Code that only the real-system suite can reach stays in thin adapters with a written reason for the
 mutation-test skip, as 0.1.0 does today.
@@ -598,6 +632,64 @@ reads 0.2.0 flags while it runs 0.1.0, or the reverse.
    them to the GitHub release with SHA-256 checksums and build provenance attestations. `cargo
    install` stays.
 
+### Results of phase 6
+
+**The runner matrix.** The `Real system` workflow passed on all five jobs. The memory limit column
+is the case that allocates past a `64M` `--memory-max` with no swap; a run of `true` is the launch
+plus the time to notice the end, as a median of 10.
+
+| Runner | systemd | Linux | Memory limit case | Run of `true`, `cgroup` / `poll` |
+| --- | --- | --- | --- | --- |
+| Ubuntu 22.04, `x86_64` | 249 | 6.8 | `job_pressure` after 40 s | 50 ms / 250 ms |
+| Ubuntu 22.04, `aarch64` | 249 | 6.8 | `job_pressure` after 46 s | 50 ms / 251 ms |
+| Ubuntu 24.04, `x86_64` | 255 | 7.0 | `job_limit` after 8 s | 50 ms / 251 ms |
+| Ubuntu 24.04, `aarch64` | 255 | 7.0 | `job_limit` after 9 s | 50 ms / 250 ms |
+| Container, 768 MiB, no swap | none | 7.0 | not run (`poll` only) | not run |
+
+Linux 6.8 did not kill the job at its limit: the job stalled there, read about 70% of job
+pressure, and the default `job_pressure` ended it. The `cgroup` launch itself, from the preflight
+to the launch, took about 30 ms; `poll` takes longer for a short command because its loop notices
+the end up to 100 ms late and then waits for the process group.
+
+**The traces.** Every trace under `tests/fixtures/traces` gets its decision from the replay. The
+pressures are `full avg10`; free room is the lowest share of the domain.
+
+| Trace | Domain pressure, peak | Free room, lowest | Job pressure, peak | Decision of the defaults |
+| --- | --- | --- | --- | --- |
+| build, `x86_64` and `aarch64` | 0% | 89% | 0% | continue |
+| renderer, `x86_64` | 0% | 76% | 0% | continue |
+| model load, `aarch64` | 0.24% | 57% | 0% | continue |
+| memory ramp in a scope, `x86_64` | 22% at 84% free | 84% | 29% | continue |
+| memory ramp in a scope, `aarch64` | 9% | 86% | 8% | continue |
+| machine pressure, `x86_64` | 24% | 0.3% | none (`poll`) | `domain_floor` at 55 s; without the floor, `domain_pressure` at 78 s |
+| machine pressure, `aarch64` | 34% | 0.3% | none (`poll`) | `domain_floor` at 52 s; without the floor, `domain_pressure` at 73 s |
+
+The machine pressure runs thrashed from 66 s (`x86_64`) and 61 s (`aarch64`) on, when the free room
+fell below 2%; before that, their pressure stayed below 1%. The floor stopped both about 10 s before
+the thrash. The memory ramp in a scope shows the false signal that the new rule removes: the job
+swapped at its own `memory.high`, and the machine read 22% with 84% of its memory free.
+
+**The defaults that follow.**
+
+- `--domain-pressure` falls from `20%` to `10%` for `10s`, and counts only on a domain short of
+  memory, below a quarter of free room. `20%` never stopped the `x86_64` thrash.
+- `--job-pressure` stays `60%` for `30s`. A job that swapped at its `memory.high` read up to 29% and
+  kept working, and a job stalled at its `memory.max` read about 70%; healthy runs read 0%.
+- `--min-mem` stays `15%`, at least `256M`, at most `16G`: it stopped both thrashing runs first.
+
+**Unified GPU memory.** On a machine with unified GPU memory (`aarch64`), an official llama.cpp
+CUDA build loaded a 1.45 GiB model with all layers on the GPU, through
+`oomwrap run --backend cgroup --memory-max 6G`, with direct reads, so the page cache of the model
+file played no part. The GPU process held 1,672 MiB. The scope's `memory.current` was 596 MiB after
+the load (225 MiB anonymous memory, 292 MiB of mapped files such as the libraries, and 208 MiB of
+shared memory) and 764 MiB after two requests, with a peak of 770 MiB. The memory controller
+therefore does not charge the GPU's allocations to the job, and `--memory-max` does not bound them.
+The model answered at 80 tokens per second. Step 12 of [The end state](#the-end-state) is needed.
+
+**Free room of a cgroup domain.** In the container, after 400 MiB of file cache, oomwrap reported
+755 MiB of free room, while `memory.max − memory.current` was 355 MiB. A job then took 627 MiB
+without a kill: the kernel gave the inactive file pages back, so the estimate holds.
+
 ## The end state
 
 0.2.0 guards one job well. The end state guards a user's whole set of heavy jobs: each job holds a
@@ -622,8 +714,8 @@ every outcome explained. Each step below is its own release after 0.2.0.
     are not allowed, oomwrap reads `avg10` as before.
 11. **A documented event schema.** The schema of the event log is documented and kept stable, and
     `oomwrap explain` turns a log into the story of each stop: reason, readings and limits.
-12. **Count device memory that comes from system RAM.** When phase 6 shows that the cgroup does not
-    charge a unified-memory GPU's allocations, oomwrap adds them to the job's readings and a new
+12. **Count device memory that comes from system RAM.** Phase 6 showed that the cgroup does not
+    charge a unified-memory GPU's allocations, so oomwrap adds them to the job's readings and a new
     reason, `device_memory`, stops the job when the sum passes `--memory-max`. Sources, in order:
     the kernel's `dmem` controller (`dmem.current`) where the driver registers its regions, then the
     DRM per-file memory statistics in `/proc/<pid>/fdinfo`, then a vendor library such as NVML only
@@ -651,7 +743,8 @@ What stays out:
 
 - **Memory outside the cgroup's count.** A device driver can allocate memory for the job that the
   memory controller does not charge, for example unified GPU memory. The domain conditions stay for
-  that reason; phase 6 checks a model load on such a machine, and step 12 counts that memory.
+  that reason; phase 6 measured a model load on such a machine (the GPU held 1,672 MiB, the job's
+  cgroup 596 MiB), and step 12 counts that memory.
 - **Concurrent jobs before step 8.** Each job's cap uses the free room at its own launch, so jobs
   that start together can each claim the same room. Only the domain conditions catch the sum.
 - **A job that lowers its own score.** An unprivileged process can lower its `oom_score_adj` again,
@@ -660,12 +753,15 @@ What stays out:
 - **The control socket through `systemd-run`.** `exec-job` connects to the socket by its path, so
   `systemd-run` passes no descriptor; the job only needs to see the guard's runtime folder, which a
   scope does not hide. The CI runner matrix checks the handshake on systemd 249 and 255.
-- **Launch cost.** `systemd-run` adds a bus round trip to each launch. Phase 6 measures it, and the
-  default shim list stays limited to long-running tools.
-- **Domain pressure default.** `20%` for `10s` is provisional until the machine pressure traces of
-  phase 6.
+- **Launch cost.** `systemd-run` adds a bus round trip to each launch. Phase 6 measured it (see
+  [Results of phase 6](#results-of-phase-6)), and the default shim list stays limited to
+  long-running tools.
+- **A job that stalls at its limit.** Linux 6.8 let a job stall at its `memory.max` for more than
+  90 s without a kill. `job_pressure` ends it after `--job-pressure-for`; with
+  `--job-pressure 100%` such a job can stay stalled until the kernel acts.
 - **Free room in a cgroup domain.** `memory.max − memory.current + inactive_file` approximates
-  `MemAvailable`; phase 6 compares it with the kernel's own reclaim in the container job.
+  `MemAvailable`. Phase 6 compared it with the kernel's own reclaim in the container job: with
+  400 MiB of file cache, a job took the reported room without a kill.
 - **Breaking change.** Scripts and 0.1.0 shims and wrappers that pass `--min-swap` fail with an
   error after the upgrade. The changelog lists the upgrade steps: install the shims again, run
   `oomwrap wrap` again on each wrapped path.
