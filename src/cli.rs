@@ -13,10 +13,11 @@ use crate::config::Profile;
 use crate::doctor::{self, Defaults};
 use crate::events::EventLog;
 use crate::host::Host;
+use crate::job_limits::JobLimitSettings;
 use crate::launch;
 use crate::limits::{GuardPolicy, Pressure, PressureLimit, Size, SizeSetting, parse_duration};
 use crate::shims::{self, ScriptFloors, default_bin_dir};
-use crate::supervise::{self, MachineGuardRequirement, RunOptions};
+use crate::supervise::{self, BackendRequest, MachineGuardRequirement, RunOptions};
 
 const DEFAULTS: Defaults = Defaults {
     poll: "1s",
@@ -42,6 +43,9 @@ enum Commands {
     /// The first process of a guarded job; `oomwrap run` starts it.
     #[command(hide = true)]
     ExecJob(ExecJobArgs),
+    /// Keeps a job's scope until its guard has read why the job ended.
+    #[command(hide = true)]
+    HoldScope(HoldScopeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -50,8 +54,22 @@ struct ExecJobArgs {
     #[arg(long)]
     control: PathBuf,
 
+    /// The lock of the guard; `exec-job` starts a holder of the scope.
+    #[arg(long)]
+    hold_scope: Option<PathBuf>,
+
     #[arg(required = true, last = true)]
     command: Vec<OsString>,
+}
+
+#[derive(Args, Debug)]
+struct HoldScopeArgs {
+    #[arg(long)]
+    lock: PathBuf,
+
+    /// Wait for the lock; without it, start the holder that waits.
+    #[arg(long)]
+    stay: bool,
 }
 
 #[derive(Args, Debug)]
@@ -66,10 +84,46 @@ struct InspectArgs {
     json: bool,
 }
 
+/// The values of `--backend`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum BackendFlag {
+    /// `cgroup` when its checks pass, `poll` otherwise
+    Auto,
+    /// A transient scope with kernel limits; exit 3 when it is not available
+    Cgroup,
+    /// The process-group guard, without kernel limits
+    Poll,
+}
+
+impl From<BackendFlag> for BackendRequest {
+    fn from(flag: BackendFlag) -> Self {
+        match flag {
+            BackendFlag::Auto => Self::Auto,
+            BackendFlag::Cgroup => Self::Cgroup,
+            BackendFlag::Poll => Self::Poll,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 struct RunArgs {
     #[arg(long, value_enum, default_value_t = Profile::Auto)]
     profile: Profile,
+
+    #[arg(long, value_enum, default_value_t = BackendFlag::Auto)]
+    backend: BackendFlag,
+
+    /// Hard limit of the job [default: smallest of 85%, the free room minus --min-mem, and the lowest memory.max above the scope]
+    #[arg(long)]
+    memory_max: Option<Size>,
+
+    /// Soft limit of the job [default: 90% of --memory-max]
+    #[arg(long)]
+    memory_high: Option<Size>,
+
+    /// The job's own swap limit [default: not set]
+    #[arg(long)]
+    memory_swap_max: Option<Size>,
 
     /// Floor for the memory domain's free room [default: 15%, at least 256M, at most 16G]
     #[arg(long)]
@@ -83,6 +137,14 @@ struct RunArgs {
     // A negative number reaches the parser, which names the flag and the fault.
     #[arg(long, allow_negative_numbers = true, value_parser = parse_duration)]
     domain_pressure_for: Option<Duration>,
+
+    /// PSI `full avg10` limit of the job's cgroup [default: 60%]
+    #[arg(long)]
+    job_pressure: Option<Pressure>,
+
+    /// How long the job's pressure must last before a stop [default: 30s]
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_duration)]
+    job_pressure_for: Option<Duration>,
 
     #[arg(long, allow_negative_numbers = true, default_value = DEFAULTS.poll, value_parser = parse_duration)]
     poll: Duration,
@@ -107,15 +169,6 @@ struct RunArgs {
     /// Write every reading and the policy's decision to this file, as JSON lines
     #[arg(long, value_name = "PATH")]
     record_readings: Option<PathBuf>,
-
-    #[arg(long)]
-    use_systemd_scope: bool,
-
-    #[arg(long)]
-    memory_high: Option<Size>,
-
-    #[arg(long)]
-    memory_max: Option<Size>,
 
     /// The command starts at its first word; an unknown flag before it is an
     /// error, never the command.
@@ -203,13 +256,26 @@ fn dispatch(command: Commands, host: &Host) -> Result<i32> {
             shims::wrap(&args.path, &floors, args.force).map(|()| 0)
         }
         Commands::Unwrap(args) => shims::unwrap(&args.path).map(|()| 0),
-        Commands::ExecJob(args) => Ok(launch::exec_job(&args.control, &args.command)),
+        Commands::ExecJob(args) => Ok(launch::exec_job(
+            &args.control,
+            args.hold_scope.as_deref(),
+            &args.command,
+            &host.proc_root,
+        )),
+        Commands::HoldScope(args) => Ok(launch::hold_scope(&args.lock, args.stay)),
     }
 }
 
 fn run_guard(args: RunArgs, host: &Host) -> Result<i32> {
-    if args.use_systemd_scope || args.memory_high.is_some() || args.memory_max.is_some() {
-        bail!("systemd scope support is planned but not implemented in this release");
+    let job_limits = JobLimitSettings {
+        memory_max: args.memory_max,
+        memory_high: args.memory_high,
+        memory_swap_max: args.memory_swap_max,
+    };
+    if args.backend == BackendFlag::Poll && job_limits.is_explicit() {
+        bail!(
+            "--memory-max, --memory-high and --memory-swap-max need the cgroup backend; drop --backend poll"
+        );
     }
     let machine_guard = if args.require_machine_guard {
         MachineGuardRequirement::Required
@@ -221,7 +287,12 @@ fn run_guard(args: RunArgs, host: &Host) -> Result<i32> {
     let defaults = GuardPolicy::default();
     let policy = GuardPolicy {
         min_mem: args.min_mem.map_or(defaults.min_mem, SizeSetting::Given),
-        job_pressure: defaults.job_pressure,
+        job_pressure: PressureLimit {
+            at_least: args.job_pressure.unwrap_or(defaults.job_pressure.at_least),
+            lasting: args
+                .job_pressure_for
+                .unwrap_or(defaults.job_pressure.lasting),
+        },
         domain_pressure: PressureLimit {
             at_least: args
                 .domain_pressure
@@ -234,6 +305,8 @@ fn run_guard(args: RunArgs, host: &Host) -> Result<i32> {
     let options = RunOptions {
         profile: args.profile,
         policy,
+        job_limits,
+        backend: args.backend.into(),
         poll: args.poll,
         term_grace: args.term_grace,
         machine_guard,

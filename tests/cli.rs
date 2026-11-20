@@ -16,11 +16,100 @@ const MACHINE_KIB: u64 = 16 * KIB_PER_GIB;
 const ROOMY_KIB: u64 = 10 * KIB_PER_GIB;
 /// 1 MiB of free room: below the `2M` floor of the stop tests.
 const LOW_KIB: u64 = 1024;
+/// A guard waits up to 2 s and reads again before a stop for a domain
+/// reason, so that the largest of the domain's jobs stops first.
+const STAGGER_SECS: f32 = 2.0;
 
 fn meminfo(available_kib: u64) -> String {
     format!(
         "MemTotal: {MACHINE_KIB} kB\nMemAvailable: {available_kib} kB\nSwapTotal: 8388608 kB\nSwapFree: 8388608 kB\n"
     )
+}
+
+/// A fake `systemd-run`: it records its arguments, makes the scope in the fake
+/// cgroup tree from the `-p` limits, gives the job a fake `/proc/self/cgroup`
+/// that names the scope, and runs only what follows `--`. The file
+/// `systemd-run.mode` makes it fail, hang, write a wrong limit, or answer the
+/// guard with an old protocol in place of `exec-job`.
+const FAKE_SYSTEMD_RUN: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_DIR/systemd-run.log"
+unit=; max=max; high=max; swap=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    --unit) unit=$2; shift 2 ;;
+    -p) case "$2" in
+          MemoryMax=*) max=${2#MemoryMax=} ;;
+          MemoryHigh=*) high=${2#MemoryHigh=} ;;
+          MemorySwapMax=*) swap=${2#MemorySwapMax=} ;;
+        esac
+        shift 2 ;;
+    *) shift ;;
+  esac
+done
+mode=$(cat "$FAKE_DIR/systemd-run.mode" 2>/dev/null)
+case "$mode" in
+  fail) echo "Failed to connect to bus: No medium found" >&2; exit 1 ;;
+  hang) sleep 30; exit 1 ;;
+  wrong-max) max=4096 ;;
+esac
+[ "$max" = infinity ] && max=max
+[ "$high" = infinity ] && high=max
+[ "$swap" = infinity ] && swap=max
+path="$FAKE_SCOPE_PARENT/$unit.scope"
+dir="$OOMWRAP_CGROUP_ROOT$path"
+mkdir -p "$dir"
+echo "$max" > "$dir/memory.max"
+echo "$high" > "$dir/memory.high"
+[ -n "$swap" ] && echo "$swap" > "$dir/memory.swap.max"
+echo 4096 > "$dir/memory.current"
+printf 'oom 0\noom_kill 0\n' > "$dir/memory.events"
+echo $$ > "$dir/cgroup.procs"
+: > "$dir/cgroup.kill"
+job="$FAKE_DIR/job-proc"
+mkdir -p "$job/self"
+printf '0::%s\n' "$path" > "$job/self/cgroup"
+if [ "$mode" = old-protocol ]; then
+  exec python3 -c 'import json, os, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"protocol": 0, "pid": os.getpid(), "cgroup": None, "oom_score_adj_error": None}) + "\n").encode())
+s.recv(100)' "$4"
+fi
+OOMWRAP_PROC_ROOT="$job" exec "$@"
+"#;
+
+/// Shell text that sets `dir` to the job's fake scope folder.
+const SCOPE_DIR: &str =
+    r#"dir="$OOMWRAP_CGROUP_ROOT$(cut -d: -f3 "$OOMWRAP_PROC_ROOT/self/cgroup")""#;
+
+const V2_MOUNTINFO: &str = "30 1 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+
+/// The cgroup of the user manager of the user who runs the tests.
+fn user_manager() -> String {
+    let uid = nix::unistd::getuid();
+    format!("/user.slice/user-{uid}.slice/user@{uid}.service")
+}
+
+fn runs_as_root() -> bool {
+    nix::unistd::geteuid().is_root()
+}
+
+/// Where `systemd-run --scope` puts a scope: under the user manager, or
+/// under the system manager for root.
+fn scope_parent() -> String {
+    if runs_as_root() {
+        "/system.slice".to_string()
+    } else {
+        format!("{}/app.slice", user_manager())
+    }
+}
+
+fn page_size() -> u64 {
+    let size = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
+        .unwrap()
+        .unwrap();
+    u64::try_from(size).unwrap()
 }
 
 fn psi(full_avg10: &str) -> String {
@@ -43,7 +132,54 @@ impl FakeMachine {
         };
         fs::create_dir_all(machine.proc_root().join("pressure")).unwrap();
         fs::write(machine.meminfo_path(), meminfo(available_kib)).unwrap();
+        for dir in ["cgroup", "runtime", "linger"] {
+            fs::create_dir_all(machine.file(dir)).unwrap();
+        }
+        write_executable(&machine.file("systemd-run"), FAKE_SYSTEMD_RUN);
         machine
+    }
+
+    /// The variables that point oomwrap at this machine. The fake
+    /// `systemd-run` always stands in for the real one.
+    fn env(&self) -> Vec<(&'static str, PathBuf)> {
+        vec![
+            ("OOMWRAP_PROC_ROOT", self.proc_root()),
+            ("OOMWRAP_CGROUP_ROOT", self.file("cgroup")),
+            ("OOMWRAP_SYSTEMD_RUN", self.file("systemd-run")),
+            ("OOMWRAP_LINGER_DIR", self.file("linger")),
+            ("XDG_STATE_HOME", self.state_home()),
+            ("XDG_RUNTIME_DIR", self.file("runtime")),
+            ("FAKE_DIR", self.dir.path().to_path_buf()),
+            ("FAKE_SCOPE_PARENT", PathBuf::from(scope_parent())),
+        ]
+    }
+
+    /// Makes a cgroup v2 host whose caller runs in `own`, with `cgroup.kill`.
+    fn cgroup_v2(&self, own: &str) {
+        fs::create_dir_all(self.proc_root().join("self")).unwrap();
+        fs::write(self.proc_root().join("self/mountinfo"), V2_MOUNTINFO).unwrap();
+        fs::write(self.proc_root().join("self/cgroup"), format!("0::{own}\n")).unwrap();
+        let dir = self.cgroup_dir(own);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cgroup.kill"), "").unwrap();
+    }
+
+    /// A cgroup v2 host whose caller runs inside the user manager: every
+    /// check of the `cgroup` backend passes.
+    fn in_user_manager(&self) {
+        self.cgroup_v2(&format!("{}/shell.service", scope_parent()));
+    }
+
+    fn cgroup_dir(&self, path: &str) -> PathBuf {
+        self.file("cgroup").join(path.trim_start_matches('/'))
+    }
+
+    fn systemd_run_mode(&self, mode: &str) {
+        fs::write(self.file("systemd-run.mode"), mode).unwrap();
+    }
+
+    fn systemd_run_log(&self) -> String {
+        fs::read_to_string(self.file("systemd-run.log")).unwrap_or_default()
     }
 
     fn proc_root(&self) -> PathBuf {
@@ -92,8 +228,7 @@ impl FakeMachine {
 
     fn oomwrap(&self) -> Command {
         let mut cmd = Command::cargo_bin("oomwrap").unwrap();
-        cmd.env("OOMWRAP_PROC_ROOT", self.proc_root())
-            .env("XDG_STATE_HOME", self.state_home());
+        cmd.envs(self.env());
         cmd
     }
 
@@ -107,10 +242,14 @@ impl FakeMachine {
 
     /// The same as [`Self::run`], as shell text.
     fn run_line(&self) -> String {
+        let env: Vec<String> = self
+            .env()
+            .iter()
+            .map(|(name, value)| format!("{name}={}", sh_quote(&value.display().to_string())))
+            .collect();
         format!(
-            "OOMWRAP_PROC_ROOT={} XDG_STATE_HOME={} {} run --profile generic --allow-no-machine-guard",
-            sh_quote(&self.proc_root().display().to_string()),
-            sh_quote(&self.state_home().display().to_string()),
+            "{} {} run --profile generic --allow-no-machine-guard",
+            env.join(" "),
             sh_quote(&oomwrap_bin())
         )
     }
@@ -169,8 +308,7 @@ fn guarded_tool(tool: &Path, dirs: &[&Path], machine: &FakeMachine) -> Command {
     parts.push(system_path);
     let mut cmd = Command::new(tool);
     cmd.env("PATH", parts.join(":"))
-        .env("OOMWRAP_PROC_ROOT", machine.proc_root())
-        .env("XDG_STATE_HOME", machine.state_home())
+        .envs(machine.env())
         .env("OOMWRAP_ALLOW_NO_MACHINE_GUARD", "1");
     cmd
 }
@@ -741,19 +879,43 @@ fn run_refuses_the_flags_of_0_1_0() {
 }
 
 #[test]
-fn run_rejects_unsupported_systemd_scope_flag() {
+fn explicit_limits_need_the_cgroup_backend() {
+    // The fake machine has no cgroup v2 hierarchy.
     let machine = FakeMachine::new(ROOMY_KIB);
+    let counter = machine.file("ran");
+    let count = format!("echo ran >> {}", sh_quote(&counter.display().to_string()));
     for flags in [
-        &["--use-systemd-scope"][..],
-        &["--memory-high", "1G"][..],
         &["--memory-max", "1G"][..],
+        &["--memory-high", "1G"][..],
+        &["--memory-swap-max", "0"][..],
+        &["--backend", "cgroup"][..],
     ] {
         let mut cmd = machine.run();
-        cmd.args(flags).args(["--", "bash", "-lc", "exit 0"]);
-        cmd.assert()
-            .code(2)
-            .stderr(predicate::str::contains("systemd scope support"));
+        cmd.args(flags).args(["--", "sh", "-c", &count]);
+        cmd.assert().code(3).stderr(predicate::str::contains(
+            "refusing to launch: the cgroup backend is not available: the host does not use cgroup v2 alone",
+        ));
     }
+    assert!(
+        !counter.exists(),
+        "the command must not run without its limits"
+    );
+    let events = read_events(&default_log(&machine));
+    let refused = events
+        .iter()
+        .find(|event| event["event"] == "refused")
+        .unwrap();
+    assert_eq!(refused["reason"], "cgroup_unavailable");
+    let mut poll = machine.run();
+    poll.args(["--backend", "poll", "--memory-max", "1G", "--", "true"]);
+    poll.assert()
+        .code(2)
+        .stderr(predicate::str::contains("drop --backend poll"));
+    let mut old = machine.run();
+    old.args(["--use-systemd-scope", "--", "true"]);
+    old.assert()
+        .code(2)
+        .stderr(predicate::str::contains("--use-systemd-scope"));
 }
 
 #[test]
@@ -878,9 +1040,9 @@ fn run_stops_on_lasting_domain_pressure() {
         &script,
     ]);
     let started = Instant::now();
-    cmd.assert()
-        .code(137)
-        .stderr(predicate::str::contains("memory pressure: domain_pressure"));
+    cmd.assert().code(137).stderr(predicate::str::contains(
+        "stopping the job: domain_pressure",
+    ));
     let elapsed = started.elapsed();
     assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
@@ -1047,7 +1209,7 @@ fn run_reaps_cooperative_term_without_waiting_full_grace() {
         "--poll",
         "50ms",
         "--term-grace",
-        "1500ms",
+        "5s",
         "--",
         "bash",
         "-lc",
@@ -1056,7 +1218,7 @@ fn run_reaps_cooperative_term_without_waiting_full_grace() {
     let started = Instant::now();
     cmd.assert().code(137);
     assert!(
-        started.elapsed().as_secs_f32() < 1.0,
+        started.elapsed().as_secs_f32() < STAGGER_SECS + 1.0,
         "guard should not wait full grace after the child exits on TERM"
     );
 }
@@ -1270,7 +1432,7 @@ fn run_handles_huge_durations_without_panic() {
         .code(137)
         .stderr(predicate::str::contains("panicked").not());
     assert!(
-        started.elapsed().as_secs_f32() < 1.0,
+        started.elapsed().as_secs_f32() < STAGGER_SECS + 1.0,
         "cooperative child should not wait huge TERM grace"
     );
 }
@@ -1824,4 +1986,359 @@ fn wrap_refuses_dangling_real_sidecar_without_force() {
     cmd.assert()
         .code(2)
         .stderr(predicate::str::contains("refusing to overwrite"));
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// A file that counts each start of the command, and the shell text that
+/// adds one line to it.
+fn counting(machine: &FakeMachine) -> (PathBuf, String) {
+    let counter = machine.file("ran");
+    let count = format!("echo ran >> {}", sh_quote(&counter.display().to_string()));
+    (counter, count)
+}
+
+fn runs(counter: &Path) -> usize {
+    fs::read_to_string(counter).map_or(0, |text| text.lines().count())
+}
+
+fn event<'a>(events: &'a [serde_json::Value], kind: &str) -> &'a serde_json::Value {
+    events
+        .iter()
+        .find(|event| event["event"] == kind)
+        .unwrap_or_else(|| panic!("no {kind} event in {events:?}"))
+}
+
+fn detail(event: &serde_json::Value) -> &str {
+    event["detail"].as_str().unwrap_or_default()
+}
+
+#[test]
+fn the_cgroup_backend_starts_the_job_in_a_scope_with_its_limits() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    machine.in_user_manager();
+    let (counter, count) = counting(&machine);
+    let locks = machine.file("runtime/oomwrap");
+    let script = format!(
+        "{count}; ls {}; cat /proc/self/oom_score_adj; exit 7",
+        sh_quote(&locks.display().to_string())
+    );
+    let mut cmd = machine.run();
+    cmd.args(["--min-mem", "1G", "--", "sh", "-c", &script]);
+    let output = cmd.assert().code(7).get_output().stdout.clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert_eq!(runs(&counter), 1);
+    assert!(stdout.starts_with("oomwrap-generic-"), "{stdout}");
+    assert!(stdout.contains(".lock\n"), "{stdout}");
+    assert!(stdout.ends_with("1000\n"), "{stdout}");
+    assert_eq!(
+        fs::read_dir(&locks).unwrap().count(),
+        0,
+        "the lock goes with its guard"
+    );
+
+    // 10G free minus the 1G floor is below 85% of the 16G machine.
+    let max = 9 * GIB;
+    let high = max * 90 / 100 / page_size() * page_size();
+    let log = machine.systemd_run_log();
+    let user = if runs_as_root() { "" } else { "--user " };
+    assert!(
+        log.starts_with(&format!(
+            "{user}--scope --quiet --collect --unit oomwrap-generic-"
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "-p MemoryMax={max} -p MemoryHigh={high} -- /proc/"
+        )),
+        "{log}"
+    );
+    assert!(!log.contains("MemorySwapMax"), "{log}");
+
+    let events = read_events(&default_log(&machine));
+    let launched = event(&events, "launched");
+    let unit = launched["unit"].as_str().unwrap();
+    assert_eq!(launched["backend"], "cgroup");
+    assert_eq!(
+        launched["cgroup"],
+        format!("{}/{unit}.scope", scope_parent())
+    );
+    assert_eq!(launched["job_limits"]["memory_max"], max);
+    assert_eq!(launched["job_limits"]["memory_high"], high);
+    assert!(detail(launched).contains("holds the job limits"));
+    assert_eq!(event(&events, "exited")["exit_code"], 7);
+}
+
+#[test]
+fn explicit_limits_go_to_the_scope_in_whole_pages() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    machine.in_user_manager();
+    let mut cmd = machine.run();
+    cmd.args([
+        "--memory-max",
+        "100000001",
+        "--memory-swap-max",
+        "0",
+        "--backend",
+        "cgroup",
+        "--",
+        "true",
+    ]);
+    cmd.assert().success();
+    let max = 100_000_001 / page_size() * page_size();
+    let high = 100_000_001 * 90 / 100 / page_size() * page_size();
+    let log = machine.systemd_run_log();
+    assert!(
+        log.contains(&format!(
+            "-p MemoryMax={max} -p MemoryHigh={high} -p MemorySwapMax=0 --"
+        )),
+        "{log}"
+    );
+}
+
+/// Runs `sh -c <script>` in a fake scope with `flags`; the script finds its
+/// scope folder in `$dir`.
+fn run_in_fake_scope(machine: &FakeMachine, flags: &[&str], script: &str) -> Output {
+    let mut cmd = machine.run();
+    cmd.args(flags)
+        .args(["--", "sh", "-c", &format!("{SCOPE_DIR}; {script}")]);
+    cmd.output().unwrap()
+}
+
+#[test]
+fn a_kernel_kill_in_the_scope_ends_the_job_at_once() {
+    for (counts, reason) in [
+        ("oom 1\\noom_kill 1", "job_limit"),
+        ("oom 0\\noom_kill 1", "outside_oom_kill"),
+    ] {
+        let machine = FakeMachine::new(ROOMY_KIB);
+        machine.in_user_manager();
+        let scope_file = machine.file("scope");
+        let script = format!(
+            "echo \"$dir\" > {}; sleep 0.2; printf '{counts}\\n' > \"$dir/memory.events\"; sleep 30",
+            sh_quote(&scope_file.display().to_string())
+        );
+        let started = Instant::now();
+        let output = run_in_fake_scope(
+            &machine,
+            &["--poll", "50ms", "--term-grace", "20s"],
+            &script,
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(137), "{stderr}");
+        assert!(
+            stderr.contains(&format!("stopping the job: {reason}")),
+            "{stderr}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a kernel kill gets no grace"
+        );
+        let dir = PathBuf::from(fs::read_to_string(&scope_file).unwrap().trim());
+        assert_eq!(fs::read_to_string(dir.join("cgroup.kill")).unwrap(), "1");
+        let events = read_events(&default_log(&machine));
+        let stopped = event(&events, "stopped");
+        assert_eq!(stopped["reason"], reason);
+        assert_eq!(stopped["readings"]["job"]["events"]["oom_kill"], 1);
+    }
+}
+
+#[test]
+fn a_job_killed_at_its_limit_ends_as_job_limit_after_its_scope_is_gone() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    machine.in_user_manager();
+    // systemd removes the scope once the kernel killed its last process.
+    let script = "printf 'oom 1\\noom_kill 1\\n' > \"$dir/memory.events\"; sleep 0.3; mv \"$dir\" \"$dir.gone\"; exit 0";
+    let output = run_in_fake_scope(&machine, &["--poll", "10s"], script);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(137), "{stderr}");
+    assert!(stderr.contains("stopping the job: job_limit"), "{stderr}");
+    let events = read_events(&default_log(&machine));
+    assert_eq!(event(&events, "stopped")["reason"], "job_limit");
+}
+
+#[test]
+fn lasting_job_pressure_stops_the_job() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    machine.in_user_manager();
+    let script = format!(
+        "sleep 0.2; printf '{}' > \"$dir/memory.pressure\"; sleep 30",
+        psi("70.00").replace('\n', "\\n")
+    );
+    let flags = [
+        "--poll",
+        "50ms",
+        "--job-pressure",
+        "50%",
+        "--job-pressure-for",
+        "100ms",
+        "--term-grace",
+        "100ms",
+    ];
+    let output = run_in_fake_scope(&machine, &flags, &script);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(137), "{stderr}");
+    assert!(
+        stderr.contains(
+            "job_pressure: memory pressure of the job is 70.00%, at or above --job-pressure 50.00%"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_failed_scope_launch_falls_back_to_poll_once_or_exits_with_3() {
+    for (mode, cause) in [
+        ("wrong-max", "the scope's memory.max is 4096B"),
+        ("fail", "before its report"),
+        ("old-protocol", "exec-job speaks protocol version 0"),
+    ] {
+        let machine = FakeMachine::new(ROOMY_KIB);
+        machine.in_user_manager();
+        machine.systemd_run_mode(mode);
+        let (counter, count) = counting(&machine);
+        let mut auto = machine.run();
+        auto.args(["--", "sh", "-c", &count]);
+        auto.assert().success().stderr(predicate::str::contains(
+            "starting the command with the poll backend",
+        ));
+        assert_eq!(runs(&counter), 1, "{mode}: the command starts once");
+        let events = read_events(&default_log(&machine));
+        let launched = event(&events, "launched");
+        assert_eq!(launched["backend"], "poll", "{mode}");
+        assert!(launched.get("unit").is_none(), "{mode}");
+        assert!(
+            detail(launched).starts_with("auto took poll: the cgroup launch failed: "),
+            "{mode}: {launched}"
+        );
+        assert!(detail(launched).contains(cause), "{mode}: {launched}");
+
+        let mut required = machine.run();
+        required.args(["--backend", "cgroup", "--", "sh", "-c", &count]);
+        required
+            .assert()
+            .code(3)
+            .stderr(predicate::str::contains(cause));
+        assert_eq!(
+            runs(&counter),
+            1,
+            "{mode}: --backend cgroup never starts it"
+        );
+    }
+}
+
+#[test]
+fn a_signal_during_the_scope_launch_ends_oomwrap_before_the_command() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    machine.in_user_manager();
+    machine.systemd_run_mode("hang");
+    let (counter, count) = counting(&machine);
+    let mut cmd = machine.run();
+    cmd.args(["--", "sh", "-c", &count])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // The guard is this test's own child; only it receives the signal.
+    let mut guard = cmd.spawn().unwrap();
+    let started = wait_for_file(&machine.file("systemd-run.log"));
+    std::thread::sleep(Duration::from_millis(100));
+    Command::new("kill")
+        .arg("-TERM")
+        .arg(guard.id().to_string())
+        .assert()
+        .success();
+    let status = guard.wait().unwrap();
+    assert!(started, "the fake systemd-run never ran");
+    assert_eq!(status.code(), Some(143));
+    assert_eq!(runs(&counter), 0);
+}
+
+#[test]
+fn auto_keeps_the_job_in_place_when_a_scope_would_leave_a_limit() {
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let own = format!("{}/limited.service", scope_parent());
+    machine.cgroup_v2(&own);
+    fs::write(machine.cgroup_dir(&own).join("memory.high"), "8589934592\n").unwrap();
+    machine.run().args(["--", "true"]).assert().success();
+    let events = read_events(&default_log(&machine));
+    let launched = event(&events, "launched");
+    assert_eq!(launched["backend"], "poll");
+    assert!(
+        detail(launched).contains(&format!("the caller's cgroup {own} sets memory.high")),
+        "{launched}"
+    );
+    assert_eq!(machine.systemd_run_log(), "");
+}
+
+#[test]
+fn a_session_caller_needs_lingering_for_a_scope() {
+    if runs_as_root() {
+        // The system manager needs no lingering.
+        return;
+    }
+    let machine = FakeMachine::new(ROOMY_KIB);
+    let uid = nix::unistd::getuid();
+    machine.cgroup_v2(&format!("/user.slice/user-{uid}.slice/session-2.scope"));
+    machine.run().args(["--", "true"]).assert().success();
+    assert_eq!(machine.systemd_run_log(), "");
+    let user = nix::unistd::User::from_uid(uid).unwrap().unwrap();
+    fs::write(machine.file("linger").join(user.name), "").unwrap();
+    machine.run().args(["--", "true"]).assert().success();
+    assert!(machine.systemd_run_log().contains("--scope"));
+    let text = fs::read_to_string(default_log(&machine)).unwrap();
+    assert!(text.contains("lingering is off"), "{text}");
+    assert!(text.contains("\"backend\":\"cgroup\""), "{text}");
+}
+
+#[test]
+fn no_room_for_the_job_at_launch_refuses_with_4() {
+    let machine = FakeMachine::new(KIB_PER_GIB);
+    machine.in_user_manager();
+    let mut cmd = machine.run();
+    cmd.args(["--min-mem", "1G", "--", "true"]);
+    cmd.assert().code(4).stderr(predicate::str::contains(
+        "leaves the job no room above --min-mem 1.0GiB",
+    ));
+    assert_eq!(machine.systemd_run_log(), "");
+}
+
+#[test]
+fn the_holder_of_a_scope_stays_until_the_guard_releases_its_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock_path = dir.path().join("oomwrap-generic-1.lock");
+    let lock = fs::File::create(&lock_path).unwrap();
+    lock.try_lock().unwrap();
+    let output = Command::cargo_bin("oomwrap")
+        .unwrap()
+        .args(["hold-scope", "--lock"])
+        .arg(&lock_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let holder: u32 = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The holder is no child of the process that started it, and has its
+    // own process group, so the job's group signals never reach it.
+    let stat = fs::read_to_string(format!("/proc/{holder}/stat")).unwrap();
+    let fields: Vec<&str> = stat
+        .rsplit(')')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert_eq!(fields[2], holder.to_string(), "{stat}");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(process_exists(holder), "the holder must wait for the lock");
+    drop(lock);
+    wait_for_process_exit(holder);
+
+    let mut gone = assert_cmd::Command::cargo_bin("oomwrap").unwrap();
+    gone.args(["hold-scope", "--stay", "--lock"])
+        .arg(dir.path().join("missing.lock"))
+        .timeout(Duration::from_secs(5))
+        .assert()
+        .success();
 }

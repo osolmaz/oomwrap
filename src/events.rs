@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use crate::backend::BackendKind;
 use crate::domain::Domain;
+use crate::job_limits::JobLimits;
 use crate::limits::StopLimits;
 use crate::policy::{Decision, StopReason};
 use crate::readings::Readings;
@@ -75,6 +76,8 @@ pub(crate) enum EventKind {
 pub(crate) enum EventReason {
     NoMachineGuard,
     LaunchFailed,
+    /// The `cgroup` backend was required and is not available.
+    CgroupUnavailable,
     #[serde(untagged)]
     Stop(StopReason),
 }
@@ -92,6 +95,12 @@ pub(crate) struct RunContext {
     pub(crate) command: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pid: Option<u32>,
+    /// The scope's unit name, in the `cgroup` backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unit: Option<String>,
+    /// The scope's cgroup path, in the `cgroup` backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cgroup: Option<String>,
 }
 
 impl RunContext {
@@ -107,6 +116,7 @@ impl RunContext {
             reason: None,
             readings: None,
             limits: None,
+            job_limits: None,
             oom_score_adj: None,
             exit_code: None,
             signal: None,
@@ -136,6 +146,9 @@ pub(crate) struct Event {
     readings: Option<Readings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     limits: Option<StopLimits>,
+    /// The kernel limits of the job's scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_limits: Option<JobLimits>,
     #[serde(skip_serializing_if = "Option::is_none")]
     oom_score_adj: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,6 +172,11 @@ impl Event {
 
     pub(crate) fn with_limits(mut self, limits: StopLimits) -> Self {
         self.limits = Some(limits);
+        self
+    }
+
+    pub(crate) fn with_job_limits(mut self, limits: JobLimits) -> Self {
+        self.job_limits = Some(limits);
         self
     }
 
@@ -381,6 +399,8 @@ mod tests {
             program: Some("true".into()),
             command: None,
             pid: Some(7),
+            unit: None,
+            cgroup: None,
         }
     }
 
@@ -439,6 +459,8 @@ mod tests {
         assert_eq!(lines[0]["oom_score_adj"], 1000);
         assert_eq!(lines[0]["detail"], "done");
         assert!(lines[0].get("command").is_none());
+        assert!(lines[0].get("unit").is_none());
+        assert!(lines[0].get("job_limits").is_none());
         assert_eq!(lines[1]["reason"], "no_machine_guard");
         assert!(lines[1].get("readings").is_none());
         assert_eq!(
@@ -456,6 +478,29 @@ mod tests {
         assert_eq!(program_name("/opt/bin/tool"), "tool");
         assert_eq!(program_name("tool"), "tool");
         assert_eq!(program_name("/"), "/");
+    }
+
+    #[test]
+    fn a_scope_names_its_unit_cgroup_and_limits() {
+        use crate::job_limits::KernelLimit;
+        let mut scope = context();
+        scope.backend = BackendKind::Cgroup;
+        scope.unit = Some("oomwrap-g-1".into());
+        scope.cgroup = Some("/a/oomwrap-g-1.scope".into());
+        let event = scope.event(EventKind::Launched).with_job_limits(JobLimits {
+            memory_max: KernelLimit::Bytes(4096),
+            memory_high: KernelLimit::Max,
+            memory_swap_max: None,
+        });
+        let line = serde_json::to_value(event).unwrap();
+        assert_eq!(line["backend"], "cgroup");
+        assert_eq!(line["unit"], "oomwrap-g-1");
+        assert_eq!(line["cgroup"], "/a/oomwrap-g-1.scope");
+        assert_eq!(line["job_limits"]["memory_max"], 4096);
+        assert_eq!(
+            serde_json::to_value(EventReason::CgroupUnavailable).unwrap(),
+            "cgroup_unavailable"
+        );
     }
 
     #[test]

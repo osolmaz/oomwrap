@@ -1,4 +1,8 @@
-//! How the guarded command runs: in its own process group.
+//! How the guarded command runs: in its own process group, and with the
+//! `cgroup` backend also in its own transient scope.
+
+mod checks;
+mod scope;
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -15,8 +19,13 @@ use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use serde::Serialize;
 
-use crate::readings::parse_process_group_id;
+use crate::host::read_rss_bytes;
+use crate::readings::{JobReadings, MemoryEvents, parse_process_group_id};
 use crate::signal::{ProcessId, group_exists, signal_group, signal_process};
+pub(crate) use checks::{
+    Manager, ScopeCgroup, Unavailable, check, check_scope, systemd_run_args, unit_name,
+};
+pub(crate) use scope::{Scope, ScopeLock};
 
 /// How long a new process group may take to appear, and to empty after a signal.
 pub(crate) const PROCESS_GROUP_SETTLE: Duration = Duration::from_millis(100);
@@ -28,8 +37,70 @@ pub(crate) const SIGNAL_EXIT_BASE: i32 = 128;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BackendKind {
+    /// A transient scope with kernel limits; the stop goes through `cgroup.kill`.
+    Cgroup,
     /// The process-group guard: oomwrap polls the domain and signals the group.
     Poll,
+}
+
+/// A running job and the mechanism that holds it.
+pub(crate) enum Backend {
+    Cgroup(Scope),
+    Poll(ProcessGroup),
+}
+
+impl Backend {
+    /// The job's process group, whose leader is the guard's child.
+    pub(crate) fn group(&mut self) -> &mut ProcessGroup {
+        match self {
+            Self::Cgroup(scope) => &mut scope.group,
+            Self::Poll(group) => group,
+        }
+    }
+
+    /// The readings of the job's own cgroup; `poll` has none.
+    pub(crate) fn read_job(&self) -> Result<Option<JobReadings>> {
+        match self {
+            Self::Cgroup(scope) => scope.read().map(Some),
+            Self::Poll(_) => Ok(None),
+        }
+    }
+
+    /// The job's out-of-memory counters after its main process ended.
+    pub(crate) fn final_events(&self) -> Option<MemoryEvents> {
+        match self {
+            Self::Cgroup(scope) => Some(scope.final_events()),
+            Self::Poll(_) => None,
+        }
+    }
+
+    pub(crate) fn has_members(&self) -> bool {
+        match self {
+            Self::Cgroup(scope) => scope.has_members(),
+            Self::Poll(group) => group.has_members(),
+        }
+    }
+
+    /// `SIGTERM`, `term_grace`, then `SIGKILL` to the group, or
+    /// `cgroup.kill` to the scope.
+    pub(crate) fn terminate(&mut self, term_grace: Duration) -> Result<()> {
+        match self {
+            Self::Cgroup(scope) => {
+                scope.terminate(term_grace);
+                Ok(())
+            }
+            Self::Poll(group) => group.terminate(term_grace),
+        }
+    }
+
+    /// Ends the job without a grace: after a kill at its limit, the job has
+    /// already lost a process.
+    pub(crate) fn kill(&mut self) {
+        match self {
+            Self::Cgroup(scope) => scope.kill(),
+            Self::Poll(group) => group.kill(),
+        }
+    }
 }
 
 /// How the leader of a group ended.
@@ -148,6 +219,17 @@ impl ProcessGroup {
     /// Tells whether any member of the group is still running.
     pub(crate) fn has_members(&self) -> bool {
         process_group_exists(self.pgid)
+    }
+
+    /// The resident memory of the group's members, as `poll` measures a job.
+    pub(crate) fn rss_bytes(&self) -> Option<u64> {
+        let pids = process_group_member_pids(self.pgid).ok()?;
+        Some(
+            pids.iter()
+                .filter_map(|pid| read_rss_bytes(&Path::new("/proc").join(pid.to_string())).ok())
+                .flatten()
+                .sum(),
+        )
     }
 
     /// Sends `SIGTERM` to the group, waits up to `term_grace`, then sends `SIGKILL`.
@@ -369,6 +451,15 @@ mod tests {
         );
         assert_eq!(LeaderExit::Code(7).code(), 7);
         assert_eq!(LeaderExit::Signal(9).code(), 137);
+    }
+
+    #[test]
+    fn the_resident_memory_of_the_group_is_known() {
+        let mut group = sleeper("30");
+        let rss = group.rss_bytes();
+        end(&mut group);
+        assert!(rss.is_some_and(|bytes| bytes > 0), "{rss:?}");
+        assert_eq!(group.rss_bytes(), Some(0));
     }
 
     #[test]

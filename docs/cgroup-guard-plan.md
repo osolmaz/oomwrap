@@ -83,12 +83,16 @@ only what the launch cannot test; the launch handshake tests the rest (bus, dele
    caller that itself runs inside the user manager and so ends with it anyway. `doctor` names
    `loginctl enable-linger`. A caller running as root uses the system manager
    (`systemd-run --scope` without `--user`), which needs no lingering.
+5. **`XDG_RUNTIME_DIR` is set** for a user manager. `systemd-run --user` finds the user bus there,
+   and the guard keeps its lock there. (Added in phase 4: without the folder, the launch could only
+   fail later, and the lock had no place.)
 
 **Explicit limits are a requirement.** A `--memory-max`, `--memory-high` or `--memory-swap-max`
 from a flag or the policy file needs the `cgroup` backend: when it is not available, `auto` exits
 with 3 and names the failed check, instead of running the job without the limit. Default limits are
 best effort: in `poll`, the domain's stop conditions apply, and the `launched` event says that no
-job limit holds.
+job limit holds. `--backend poll` together with an explicit limit is a contradiction in the
+arguments and exits with 2 before any check (added in phase 4).
 
 ### Launch in a transient scope
 
@@ -96,7 +100,7 @@ job limit holds.
 systemd-run --user --scope --quiet --collect \
   --unit oomwrap-<profile>-<random> \
   -p MemoryMax=<bytes> -p MemoryHigh=<bytes> [-p MemorySwapMax=<bytes>] \
-  -- /proc/<guard pid>/exe exec-job --control <socket> -- <command> [args...]
+  -- /proc/<guard pid>/exe exec-job --control <socket> --hold-scope <lock> -- <command> [args...]
 ```
 
 oomwrap spawns `systemd-run` in a new process group, as it spawns the command today, so terminal
@@ -128,8 +132,9 @@ because `OwnedFd::from_raw_fd` is unsafe, and the crate forbids unsafe code. A s
 `exec-job` opens itself is close-on-exec from the start, and `systemd-run` no longer has to pass a
 descriptor.) The guard removes the folder as soon as `exec-job` has connected.
 
-1. `exec-job` connects, writes `1000` to `/proc/self/oom_score_adj`, reads `/proc/self/cgroup`, and
-   sends a protocol version, its process ID and the cgroup path. oomwrap checks that the process ID
+1. `exec-job` connects, starts the holder of the scope (below), writes `1000` to
+   `/proc/self/oom_score_adj`, reads `/proc/self/cgroup`, and sends a protocol version, its process
+   ID, the cgroup path and the holder's process ID. oomwrap checks that the process ID
    is the one it launched, because `systemd-run --scope` executes `exec-job` in its own process.
 2. oomwrap checks the version and that the path names `<unit>.scope`, and reads `memory.max`,
    `memory.high` and, when set, `memory.swap.max` back from that cgroup, compared in pages.
@@ -148,6 +153,24 @@ descriptor.) The guard removes the folder as soon as `exec-job` has connected.
 The `poll` backend starts the job through `exec-job` too, with the same handshake but without the
 cgroup check.
 
+The domain of a scope job starts at the scope's parent (`app.slice` of the user manager, or
+`system.slice`), not at the caller's cgroup: the launch-time cap of `--memory-max` reads it before
+the launch, and the guard reads it again from the parent of the reported scope after the
+handshake. (Phase 4: the job leaves the caller's cgroup, so the caller's domain is the wrong one,
+and check 3 already made sure that the caller's cgroups hold no limit.)
+
+**A holder keeps the scope until the guard has read it.** A probe in phase 4 found that systemd
+stops a scope, and removes its cgroup, as soon as its last process ends. When the kernel kills a
+job at its limit, the guard learns of the exit only after that, so `memory.events` was gone and the
+job showed as its own exit with 137. So `exec-job` gets `--hold-scope <lock>` and starts
+`oomwrap hold-scope`, a small process in its own process group that waits for a shared lock on the
+guard's lock file. It ends when the guard releases the lock, or when the guard dies, and it adds
+about 3 MiB to the job's use. It keeps the score that the job had before the launch, so the kernel
+kills the job first. The guard counts it as no member of the job, and `cgroup.kill` ends it with
+the job. As a second line, a thread of the guard watches `memory.events` with inotify and keeps the
+highest counters it saw, for a holder that could not start; on the probe, inotify alone lost the
+race.
+
 **The job is the first victim.** The score of `1000` from step 1 is inherited by every process of
 the job. A normal user may raise its own score, and safe Rust does both steps. The kernel's
 out-of-memory killer and `earlyoom` choose their victim by this score, so a machine-wide kill takes
@@ -156,6 +179,8 @@ the guarded job before an editor, a browser or an agent session.
 **Each guard holds a lock.** oomwrap holds a lock file, `oomwrap/<unit>.lock` in
 `$XDG_RUNTIME_DIR` (or `/run/oomwrap/` for root), for its whole run. A scope `oomwrap-*` whose lock
 nobody holds has lost its guard. A lock works where a PID in the unit name fails after PID reuse.
+A lock that cannot be made, like a `systemd-run` that cannot be started, is a failed launch: `auto`
+starts the command once with `poll`, and `cgroup` exits with 3.
 
 Rejected alternatives:
 
@@ -236,7 +261,9 @@ that stays far above `memory.high` can therefore meet `job_pressure`. That is in
 stop every guarded job at once. Before a stop for a domain reason, a guard waits and reads again,
 and stops only when the condition still holds. The wait is shorter for a job that holds a larger
 share of the domain's use, at most 2 s, so the largest job stops first and the others usually see
-the pressure end. On a shared machine, guarded jobs still stop for memory that other users' work
+the pressure end. The wait is 2 s × (1 − the job's share of the domain's use). A `cgroup` job's use is
+its `memory.current`; a `poll` job's use is the sum of the resident memory of its process group
+(phase 4), and a job whose use is unknown waits the full 2 s. On a shared machine, guarded jobs still stop for memory that other users' work
 takes: the guard protects the machine, not the job.
 
 Preflight refuses a launch (exit 4) when `domain_floor` or `domain_pressure` already holds.
@@ -262,7 +289,11 @@ never depends on `systemd-oomd` for its own decisions. When both guards act on t
 ### Stop sequence
 
 `cgroup`: send `SIGTERM` to every PID in `cgroup.procs`, wait `--term-grace`, write `1` to
-`cgroup.kill`, and wait until `cgroup.procs` is empty. `cgroup.kill` reaches every process in the
+`cgroup.kill`, and wait until `cgroup.procs` is empty. A PID from `cgroup.procs` is a target only
+when its own `/proc/<pid>/cgroup` names the scope, and the process group of the job's leader gets
+each signal too. `cgroup.kill` is written only in a folder named `oomwrap-*.scope`, and is never
+created. (Phase 4: a fake cgroup tree in a test, or a PID reused after the read, can then never
+make the guard signal a process outside the job.) `cgroup.kill` reaches every process in the
 group, also one that left the process group. After `job_limit` or `outside_oom_kill`, oomwrap writes
 `cgroup.kill` at once, because the job has already lost a process. systemd removes the scope
 (`--collect`).
@@ -326,8 +357,8 @@ The events of schema version 1, as phase 3 made them:
 | `event` | When | Fields beyond the common ones |
 | --- | --- | --- |
 | `preflight` | Before the checks | |
-| `refused` | A check refused the launch; the command did not start | `reason` (`no_machine_guard`, `launch_failed`, `domain_floor`, `domain_pressure`), `readings` for a domain reason, `detail` |
-| `launched` | The command runs | `limits` (bytes, PSI percent, milliseconds), `oom_score_adj`, `detail` |
+| `refused` | A check refused the launch; the command did not start | `reason` (`no_machine_guard`, `launch_failed`, `cgroup_unavailable`, `domain_floor`, `domain_pressure`), `readings` for a domain reason, `detail` |
+| `launched` | The command runs | `limits` (bytes, PSI percent, milliseconds), `job_limits` in `cgroup` (`memory_max`, `memory_high`, `memory_swap_max` when set, in bytes or `"max"`), `oom_score_adj`, `detail` |
 | `exec_failed` | The command could not be executed | `exit_code` (126, 127), `detail` |
 | `exited` | The command ended on its own | `exit_code`, `signal` when it ended on one |
 | `cleanup` | Members of the group remained after the command ended | `detail` |
@@ -336,7 +367,9 @@ The events of schema version 1, as phase 3 made them:
 | `guard_error` | oomwrap could no longer guard the job and ended it | `detail` |
 
 Every event has `schema_version`, `unix_ms`, `event`, `backend`, `domain`, `program` (the file name
-of the program) and, after the launch, `pid`; `command` only with `--log-command`. Fields without a
+of the program) and, after the launch, `pid`; in `cgroup`, `unit` and `cgroup`; `command` only with
+`--log-command`. Phase 4 added `cgroup_unavailable` and `job_limits` without a new schema version,
+because no release had version 1 yet. Fields without a
 value are left out. The day of a default log file is the UTC day, and a trace line is
 `{"readings": {...}, "decision": "continue"}` or `{"decision": {"stop": "<reason>"}}`.
 
@@ -415,8 +448,10 @@ Smells of 0.1.0 that the split removes:
   which must not stop on one high reading; the stagger of domain stops; and the regression test of
   the false stop: full swap, free room, no pressure, no stop.
 - **Integration, in CI:** `OOMWRAP_PROC_ROOT` and `OOMWRAP_CGROUP_ROOT`, read once into `Host`,
-  point at fake trees; they replace `OOMWRAP_MEMINFO_PATH`. `Host` names the `systemd-run` program,
-  and CI uses a fake one that runs only what follows `--`. The tests cover the handshake, `abort`, a
+  point at fake trees; they replace `OOMWRAP_MEMINFO_PATH`. `Host` names the `systemd-run` program
+  (`OOMWRAP_SYSTEMD_RUN`) and the lingering folder (`OOMWRAP_LINGER_DIR`), and CI uses a fake
+  `systemd-run` that makes the scope in the fake tree and runs only what follows `--`. `exec-job`
+  reads its cgroup through the proc root, so the fake scope can name it. The tests cover the handshake, `abort`, a
   launch that fails before the report, a failed exec, a signal during the handshake, a protocol
   version mismatch and the fallback to `poll`, and check in each case that the command ran at most
   once. Other tests change the fake pressure and event files while a bounded child runs and check

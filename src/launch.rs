@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,12 @@ pub(crate) struct Report {
     pub(crate) cgroup: Option<String>,
     /// Why `exec-job` could not raise its out-of-memory score.
     pub(crate) oom_score_adj_error: Option<String>,
+    /// The process that keeps a scope alive after the job ends.
+    #[serde(default)]
+    pub(crate) holder_pid: Option<u32>,
+    /// Why `exec-job` could not start that process.
+    #[serde(default)]
+    pub(crate) holder_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -93,21 +99,94 @@ pub(crate) fn guard_exe() -> PathBuf {
     PathBuf::from(format!("/proc/{}/exe", std::process::id()))
 }
 
-/// The arguments of `exec-job` for a command.
-pub(crate) fn exec_job_args(control: &Path, command: &[OsString]) -> Vec<OsString> {
+/// The arguments of `exec-job` for a command. `hold` is the guard's lock in
+/// the `cgroup` backend: `exec-job` then starts a holder of the scope.
+pub(crate) fn exec_job_args(
+    control: &Path,
+    hold: Option<&Path>,
+    command: &[OsString],
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "exec-job".into(),
         "--control".into(),
         control.as_os_str().to_owned(),
-        "--".into(),
     ];
+    if let Some(lock) = hold {
+        args.push("--hold-scope".into());
+        args.push(lock.as_os_str().to_owned());
+    }
+    args.push("--".into());
     args.extend(command.iter().cloned());
     args
 }
 
+/// `oomwrap hold-scope`: keeps a scope alive after the job's last process
+/// ends, until its guard releases the lock. When the kernel kills the last
+/// job process, systemd removes an empty scope at once, often before the
+/// guard can read `memory.events`; a scope that still holds this process
+/// stays. The first call starts the holder in its own process group, prints
+/// its process ID and exits, so the holder is no child of the command, and a
+/// shell's `wait` never waits for it.
+pub(crate) fn hold_scope(lock: &Path, stay: bool) -> i32 {
+    if stay {
+        // The guard holds the lock for its whole run; a shared lock waits
+        // until the guard releases it, or ends.
+        if let Ok(file) = fs::File::open(lock) {
+            let _ = file.lock_shared();
+        }
+        return 0;
+    }
+    let holder = Command::new("/proc/self/exe")
+        .arg("hold-scope")
+        .arg("--lock")
+        .arg(lock)
+        .arg("--stay")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match holder {
+        Ok(holder) => {
+            println!("{}", holder.id());
+            0
+        }
+        Err(error) => {
+            eprintln!("oomwrap hold-scope: {error}");
+            NOT_STARTED_EXIT_CODE
+        }
+    }
+}
+
+/// Starts the holder of the scope and returns its process ID.
+fn start_holder(lock: &Path) -> Result<u32, String> {
+    let output = Command::new("/proc/self/exe")
+        .arg("hold-scope")
+        .arg("--lock")
+        .arg(lock)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot start the holder of the scope: {error}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    match (output.status.success(), text.trim().parse()) {
+        (true, Ok(pid)) => Ok(pid),
+        _ => Err(format!(
+            "the holder of the scope did not start: {}",
+            text.trim()
+        )),
+    }
+}
+
 /// `oomwrap exec-job`: runs as the job's first process. Returns only when the
-/// command did not start, with the exit code of `exec-job`.
-pub(crate) fn exec_job(control: &Path, command: &[OsString]) -> i32 {
+/// command did not start, with the exit code of `exec-job`. The cgroup comes
+/// from `<proc_root>/self/cgroup`, so a test's fake scope can name it.
+pub(crate) fn exec_job(
+    control: &Path,
+    hold: Option<&Path>,
+    command: &[OsString],
+    proc_root: &Path,
+) -> i32 {
     let Some((program, args)) = command.split_first() else {
         eprintln!("oomwrap exec-job: missing command");
         return NOT_STARTED_EXIT_CODE;
@@ -119,15 +198,21 @@ pub(crate) fn exec_job(control: &Path, command: &[OsString]) -> i32 {
             return NOT_STARTED_EXIT_CODE;
         }
     };
+    // Before the score rises, so the holder keeps the lower score.
+    let holder = hold.map(start_holder);
     let report = Report {
         protocol: PROTOCOL_VERSION,
         pid: std::process::id(),
-        cgroup: fs::read_to_string("/proc/self/cgroup")
+        cgroup: fs::read_to_string(proc_root.join("self/cgroup"))
             .ok()
             .and_then(|text| parse_cgroup_v2_path(&text)),
         oom_score_adj_error: fs::write("/proc/self/oom_score_adj", JOB_OOM_SCORE_ADJ.to_string())
             .err()
             .map(|error| error.to_string()),
+        holder_pid: holder
+            .as_ref()
+            .and_then(|holder| holder.as_ref().ok().copied()),
+        holder_error: holder.and_then(Result::err),
     };
     let mut reader = BufReader::new(stream);
     if send(reader.get_mut(), &report).is_err() {
@@ -413,6 +498,8 @@ mod tests {
             pid,
             cgroup: Some("/a.scope".into()),
             oom_score_adj_error: None,
+            holder_pid: None,
+            holder_error: None,
         }
     }
 
@@ -588,8 +675,25 @@ mod tests {
 
     #[test]
     fn exec_job_arguments_end_with_the_command() {
-        let args = exec_job_args(Path::new("/run/c"), &["sh".into(), "-c".into()]);
+        let args = exec_job_args(Path::new("/run/c"), None, &["sh".into(), "-c".into()]);
         assert_eq!(args, ["exec-job", "--control", "/run/c", "--", "sh", "-c"]);
+        let held = exec_job_args(
+            Path::new("/run/c"),
+            Some(Path::new("/run/l")),
+            &["sh".into()],
+        );
+        assert_eq!(
+            held,
+            [
+                "exec-job",
+                "--control",
+                "/run/c",
+                "--hold-scope",
+                "/run/l",
+                "--",
+                "sh"
+            ]
+        );
         assert_eq!(
             guard_exe(),
             PathBuf::from(format!("/proc/{}/exe", std::process::id()))
@@ -613,8 +717,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
         let command = [OsString::from("touch"), marker.as_os_str().to_owned()];
-        assert_eq!(exec_job(&dir.path().join("missing"), &command), 3);
-        assert_eq!(exec_job(&dir.path().join("missing"), &[]), 3);
+        assert_eq!(
+            exec_job(
+                &dir.path().join("missing"),
+                None,
+                &command,
+                Path::new("/proc")
+            ),
+            3
+        );
+        assert_eq!(
+            exec_job(&dir.path().join("missing"), None, &[], Path::new("/proc")),
+            3
+        );
         assert!(!marker.exists());
     }
 }
