@@ -83,7 +83,7 @@ impl Decision {
         );
         let domain_pressure_held = holds_for(
             &mut window.domain_since_ms,
-            readings.domain.full_avg10,
+            domain_pressure(&readings.domain),
             limits.domain_pressure,
             now_ms,
         );
@@ -137,6 +137,29 @@ fn holds_for(
     }
 }
 
+/// The share of a domain's size below which its free room is short.
+///
+/// The pressure of a domain counts only while the domain is short of
+/// memory. With more room free, the pressure comes from a limit inside the
+/// domain, such as one job at its own `memory.max`, and that job's own
+/// guard handles it: on a quiet machine, the system-wide PSI follows the
+/// stall of that one job. On the CI runners of phase 6, the machine's
+/// pressure rose only below 2% of free room, while one job at its own 64M
+/// limit made the machine read 71% with 94% free.
+pub(crate) const SHORT_OF_MEMORY_PERCENT: u64 = 25;
+
+/// Tells whether the domain's free room is below
+/// [`SHORT_OF_MEMORY_PERCENT`] of its size.
+pub(crate) fn is_short_of_memory(domain: &DomainReadings) -> bool {
+    u128::from(domain.free_bytes) * 100
+        < u128::from(domain.size_bytes) * u128::from(SHORT_OF_MEMORY_PERCENT)
+}
+
+/// The pressure of the domain that counts: none while the domain has room.
+fn domain_pressure(domain: &DomainReadings) -> Option<Pressure> {
+    domain.full_avg10.filter(|_| is_short_of_memory(domain))
+}
+
 fn below_floor(domain: &DomainReadings, limits: &StopLimits) -> bool {
     domain.free_bytes < limits.min_free_bytes
 }
@@ -166,10 +189,7 @@ pub(crate) fn preflight(limits: &StopLimits, domain: &DomainReadings) -> Option<
     if below_floor(domain, limits) {
         return Some(StopReason::DomainFloor);
     }
-    if domain
-        .full_avg10
-        .is_some_and(|pressure| pressure >= limits.domain_pressure.at_least)
-    {
+    if domain_pressure(domain).is_some_and(|pressure| pressure >= limits.domain_pressure.at_least) {
         return Some(StopReason::DomainPressure);
     }
     None
@@ -265,7 +285,7 @@ mod tests {
     #[test]
     fn full_swap_with_free_room_and_no_pressure_never_stops() {
         // The false stop of 0.1.0: swap is full, but RAM is free and calm.
-        let calm = domain(8 * GIB, 0);
+        let calm = domain(3 * GIB, 0);
         assert_eq!(
             decide(&[at(0, calm, None), at(60_000, calm, None)]),
             [Decision::Continue, Decision::Continue]
@@ -283,8 +303,8 @@ mod tests {
 
     #[test]
     fn one_high_pressure_reading_does_not_stop() {
-        let high = domain(8 * GIB, 50);
-        let calm = domain(8 * GIB, 0);
+        let high = domain(3 * GIB, 50);
+        let calm = domain(3 * GIB, 0);
         assert_eq!(
             decide(&[
                 at(0, high, None),
@@ -307,7 +327,7 @@ mod tests {
 
     #[test]
     fn pressure_at_its_limit_counts() {
-        let edge = domain(8 * GIB, 20);
+        let edge = domain(3 * GIB, 20);
         let below = DomainReadings {
             full_avg10: Pressure::from_hundredths(1999),
             ..edge
@@ -327,7 +347,7 @@ mod tests {
 
     #[test]
     fn job_pressure_needs_its_own_duration() {
-        let calm = domain(8 * GIB, 0);
+        let calm = domain(3 * GIB, 0);
         let stalled = Some(job(MemoryEvents::default(), 70));
         assert_eq!(
             decide(&[
@@ -345,7 +365,7 @@ mod tests {
 
     #[test]
     fn kernel_events_tell_the_job_limit_from_an_outside_kill() {
-        let calm = domain(8 * GIB, 0);
+        let calm = domain(3 * GIB, 0);
         let limit = job(
             MemoryEvents {
                 oom: 1,
@@ -411,7 +431,7 @@ mod tests {
     fn no_psi_turns_pressure_stops_off() {
         let no_psi = DomainReadings {
             full_avg10: None,
-            ..domain(8 * GIB, 0)
+            ..domain(3 * GIB, 0)
         };
         assert_eq!(
             decide(&[at(0, no_psi, None), at(60_000, no_psi, None)]),
@@ -420,17 +440,52 @@ mod tests {
     }
 
     #[test]
+    fn pressure_of_a_domain_with_room_is_not_a_domain_stop() {
+        // A job at its own memory.max stalls a quiet machine: high
+        // system-wide pressure, 94% free.
+        let quiet = domain(15 * GIB, 71);
+        assert_eq!(
+            decide(&[
+                at(0, quiet, None),
+                at(10_000, quiet, None),
+                at(60_000, quiet, None)
+            ]),
+            [Decision::Continue, Decision::Continue, Decision::Continue]
+        );
+        assert_eq!(preflight(&limits(), &quiet), None);
+        let edge = DomainReadings {
+            free_bytes: 4 * GIB,
+            ..quiet
+        };
+        assert!(!is_short_of_memory(&edge));
+        assert!(is_short_of_memory(&DomainReadings {
+            free_bytes: 4 * GIB - 1,
+            ..quiet
+        }));
+        // The window starts again when the room comes back.
+        let short = domain(3 * GIB, 71);
+        assert_eq!(
+            decide(&[
+                at(0, short, None),
+                at(5_000, quiet, None),
+                at(10_000, short, None)
+            ]),
+            [Decision::Continue, Decision::Continue, Decision::Continue]
+        );
+    }
+
+    #[test]
     fn preflight_refuses_on_the_floor_or_standing_pressure() {
-        assert_eq!(preflight(&limits(), &domain(8 * GIB, 0)), None);
+        assert_eq!(preflight(&limits(), &domain(3 * GIB, 0)), None);
         assert_eq!(
             preflight(&limits(), &domain(GIB - 1, 0)),
             Some(StopReason::DomainFloor)
         );
         assert_eq!(
-            preflight(&limits(), &domain(8 * GIB, 20)),
+            preflight(&limits(), &domain(3 * GIB, 20)),
             Some(StopReason::DomainPressure)
         );
-        assert_eq!(preflight(&limits(), &domain(8 * GIB, 19)), None);
+        assert_eq!(preflight(&limits(), &domain(3 * GIB, 19)), None);
     }
 
     #[test]

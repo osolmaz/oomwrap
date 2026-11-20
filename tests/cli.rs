@@ -14,6 +14,9 @@ const KIB_PER_GIB: u64 = 1024 * 1024;
 const MACHINE_KIB: u64 = 16 * KIB_PER_GIB;
 /// Free room far above every floor that the tests set.
 const ROOMY_KIB: u64 = 10 * KIB_PER_GIB;
+/// Free room above the default floor of 2.4 GiB, but below a quarter of the
+/// machine: the machine is short of memory, so its pressure counts.
+const SHORT_KIB: u64 = 3 * KIB_PER_GIB;
 /// 1 MiB of free room: below the `2M` floor of the stop tests.
 const LOW_KIB: u64 = 1024;
 /// A guard waits up to 2 s and reads again before a stop for a domain
@@ -1035,8 +1038,28 @@ fn run_ignores_full_swap_while_room_and_pressure_are_fine() {
 }
 
 #[test]
-fn run_refuses_when_domain_pressure_already_holds() {
+fn the_pressure_of_a_machine_with_room_stops_nothing() {
+    // One job at its own memory.max stalls a quiet machine: its system-wide
+    // pressure is high while most of its memory is free.
     let machine = FakeMachine::new(ROOMY_KIB);
+    machine.set_pressure("71.00");
+    let mut cmd = machine.run();
+    cmd.args([
+        "--domain-pressure-for",
+        "100ms",
+        "--poll",
+        "50ms",
+        "--",
+        "bash",
+        "-lc",
+        "sleep 0.5; exit 3",
+    ]);
+    cmd.assert().code(3);
+}
+
+#[test]
+fn run_refuses_when_domain_pressure_already_holds() {
+    let machine = FakeMachine::new(SHORT_KIB);
     machine.set_pressure("30.00");
     let mut cmd = machine.run();
     cmd.args(["--", "bash", "-lc", "exit 0"]);
@@ -1051,7 +1074,7 @@ fn run_refuses_when_domain_pressure_already_holds() {
 
 #[test]
 fn run_stops_on_lasting_domain_pressure() {
-    let machine = FakeMachine::new(ROOMY_KIB);
+    let machine = FakeMachine::new(SHORT_KIB);
     machine.set_pressure("0.00");
     let event_log = machine.file("events.jsonl");
     let script = format!(
