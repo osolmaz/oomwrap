@@ -297,6 +297,27 @@ mod tests {
     }
 
     #[test]
+    fn of_two_equal_limits_the_closest_is_the_domain() {
+        let fake = FakeHost::new();
+        fake.meminfo(16 * GIB, 10 * GIB, 0);
+        fake.own_cgroup("/outer/inner");
+        limit(&fake, "/outer/inner", 4 * GIB, GIB, 0);
+        limit(&fake, "/outer", 4 * GIB, GIB, 0);
+        let domain = MemoryDomain::find(&fake.host()).unwrap();
+        assert_eq!(domain.domain, cgroup("/outer/inner"));
+    }
+
+    #[test]
+    fn a_limit_equal_to_the_machine_leaves_the_machine_as_the_domain() {
+        let fake = FakeHost::new();
+        fake.meminfo(16 * GIB, 10 * GIB, 0);
+        fake.own_cgroup("/same.slice");
+        limit(&fake, "/same.slice", 16 * GIB, GIB, 0);
+        let domain = MemoryDomain::find(&fake.host()).unwrap();
+        assert_eq!(domain.domain, Domain::Machine);
+    }
+
+    #[test]
     fn a_container_root_with_a_limit_is_the_domain() {
         let fake = FakeHost::new();
         fake.meminfo(16 * GIB, 8 * GIB, 0);
