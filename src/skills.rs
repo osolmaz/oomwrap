@@ -25,9 +25,12 @@ const EMBEDDED_FILES: [(&str, &[u8]); 3] = [
     ),
 ];
 
+/// Serves the embedded skill for `oomwrap --skill ...`. Only a first argument
+/// of `--skill` asks for it: a `--skill` in a guarded command is the
+/// command's own argument.
 pub(crate) fn handle_if_requested() -> Option<i32> {
     let argv_os: Vec<_> = env::args_os().collect();
-    if !argv_os.iter().any(|arg| arg == OsStr::new("--skill")) {
+    if !asks_for_skill(&argv_os) {
         return None;
     }
 
@@ -50,6 +53,10 @@ pub(crate) fn handle_if_requested() -> Option<i32> {
             Some(2)
         }
     }
+}
+
+fn asks_for_skill(argv: &[std::ffi::OsString]) -> bool {
+    argv.get(1).is_some_and(|arg| arg == OsStr::new("--skill"))
 }
 
 struct EmbeddedSkills {
@@ -82,5 +89,22 @@ impl EmbeddedSkills {
 
     fn root(&self) -> &Path {
         &self.root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_first_skill_flag_asks_for_the_skill() {
+        let argv = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+        assert!(asks_for_skill(&argv(&["oomwrap", "--skill", "list"])));
+        assert!(!asks_for_skill(&argv(&[
+            "oomwrap", "run", "--", "tool", "--skill"
+        ])));
+        assert!(!asks_for_skill(&argv(&["oomwrap"])));
     }
 }

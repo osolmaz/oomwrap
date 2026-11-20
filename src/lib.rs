@@ -8,6 +8,7 @@ mod doctor;
 mod domain;
 mod events;
 mod host;
+mod launch;
 mod limits;
 mod policy;
 mod readings;

@@ -237,10 +237,15 @@ impl<'de> Deserialize<'de> for Pressure {
 
 /// A pressure stop condition: PSI `full avg10` at or above `at_least` for
 /// at least `lasting`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct PressureLimit {
     pub(crate) at_least: Pressure,
+    #[serde(rename = "for_ms", serialize_with = "serialize_millis")]
     pub(crate) lasting: Duration,
+}
+
+fn serialize_millis<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u64(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// The default floor for the domain's free room: 15%, at least 256M, at most 16G.
@@ -283,7 +288,7 @@ impl Default for GuardPolicy {
 }
 
 /// The resolved stop conditions of one run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct StopLimits {
     /// The floor for the domain's free room (`--min-mem`), in bytes.
     pub(crate) min_free_bytes: u64,
@@ -494,6 +499,21 @@ mod tests {
         assert_eq!(back, pressure);
         assert!(serde_json::from_str::<Pressure>("100.5").is_err());
         assert!(serde_json::from_str::<Pressure>("-1").is_err());
+    }
+
+    #[test]
+    fn limits_serialize_in_bytes_percent_and_milliseconds() {
+        let limits = GuardPolicy::default().resolve(16 * GIB).unwrap();
+        let value = serde_json::to_value(limits).unwrap();
+        assert_eq!(value["min_free_bytes"], 16 * GIB * 15 / 100);
+        assert_eq!(value["domain_pressure"]["at_least"], 20.0);
+        assert_eq!(value["domain_pressure"]["for_ms"], 10_000);
+        assert_eq!(value["job_pressure"]["for_ms"], 30_000);
+        let huge = PressureLimit {
+            lasting: Duration::MAX,
+            ..DEFAULT_JOB_PRESSURE
+        };
+        assert_eq!(serde_json::to_value(huge).unwrap()["for_ms"], u64::MAX);
     }
 
     #[test]

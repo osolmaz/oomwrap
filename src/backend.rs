@@ -1,17 +1,19 @@
 //! How the guarded command runs: in its own process group.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use nix::errno::Errno;
 use nix::sys::signal::Signal;
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use serde::Serialize;
 
 use crate::readings::parse_process_group_id;
 use crate::signal::{ProcessId, group_exists, signal_group, signal_process};
@@ -19,44 +21,119 @@ use crate::signal::{ProcessId, group_exists, signal_group, signal_process};
 /// How long a new process group may take to appear, and to empty after a signal.
 pub(crate) const PROCESS_GROUP_SETTLE: Duration = Duration::from_millis(100);
 const PROCESS_GROUP_KILL_WAIT: Duration = Duration::from_secs(1);
+/// The base of the exit code of a process that ended on a signal.
+pub(crate) const SIGNAL_EXIT_BASE: i32 = 128;
 
-/// The guarded command, started as the leader of a new process group.
+/// The mechanism that holds and stops a job, as events name it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackendKind {
+    /// The process-group guard: oomwrap polls the domain and signals the group.
+    Poll,
+}
+
+/// How the leader of a group ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeaderExit {
+    Code(i32),
+    /// The leader ended on this signal number.
+    Signal(i32),
+}
+
+impl LeaderExit {
+    /// The exit code that a shell reports: the code, or 128 + the signal number.
+    pub(crate) fn code(self) -> i32 {
+        match self {
+            Self::Code(code) => code,
+            Self::Signal(signal) => SIGNAL_EXIT_BASE + signal,
+        }
+    }
+}
+
+/// What a look at the leader found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeaderState {
+    Running,
+    /// The leader has just stopped on a signal, such as `SIGTSTP` from Ctrl-Z.
+    Stopped,
+    Exited(LeaderExit),
+}
+
+/// A command started as the leader of a new process group. oomwrap waits for
+/// the leader with `waitpid`, which also reports a stop of the job.
 pub(crate) struct ProcessGroup {
-    child: Child,
     pgid: ProcessId,
+    exit: Option<LeaderExit>,
+    /// The leader was seen stopped and not continued since.
+    stopped: bool,
 }
 
 impl ProcessGroup {
-    pub(crate) fn spawn(command: &[OsString]) -> io::Result<Self> {
-        let Some(program) = command.first() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "missing command",
-            ));
-        };
-        let child = Command::new(program)
-            .args(&command[1..])
-            .process_group(0)
-            .spawn()?;
+    pub(crate) fn spawn(program: &OsStr, args: &[OsString]) -> io::Result<Self> {
+        let child = Command::new(program).args(args).process_group(0).spawn()?;
         let Some(pgid) = ProcessId::from_child_id(child.id()) else {
             return Err(io::Error::other(format!(
                 "child process ID {} cannot be signaled; the child runs unguarded",
                 child.id()
             )));
         };
-        Ok(Self { child, pgid })
+        // The guard waits for the child with waitpid; dropping the handle
+        // neither waits nor signals.
+        drop(child);
+        Ok(Self {
+            pgid,
+            exit: None,
+            stopped: false,
+        })
     }
 
     pub(crate) fn pgid(&self) -> ProcessId {
         self.pgid
     }
 
+    /// The process ID of the leader, which is also the group's ID.
     pub(crate) fn leader_pid(&self) -> u32 {
-        self.child.id()
+        self.pgid.as_raw().unsigned_abs()
     }
 
-    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+    /// Looks at the leader without blocking.
+    pub(crate) fn poll(&mut self) -> io::Result<LeaderState> {
+        if let Some(exit) = self.exit {
+            return Ok(LeaderState::Exited(exit));
+        }
+        let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
+        match waitpid(self.pgid.as_pid(), Some(flags)).map_err(io::Error::from)? {
+            WaitStatus::Stopped(..) => {
+                self.stopped = true;
+                Ok(LeaderState::Stopped)
+            }
+            WaitStatus::Continued(_) => {
+                self.stopped = false;
+                Ok(LeaderState::Running)
+            }
+            status => Ok(self.record(status)),
+        }
+    }
+
+    /// Waits until the leader exits.
+    pub(crate) fn wait(&mut self) -> io::Result<LeaderExit> {
+        loop {
+            if let Some(exit) = self.exit {
+                return Ok(exit);
+            }
+            let status = waitpid(self.pgid.as_pid(), None).map_err(io::Error::from)?;
+            self.record(status);
+        }
+    }
+
+    fn record(&mut self, status: WaitStatus) -> LeaderState {
+        let exit = match status {
+            WaitStatus::Exited(_, code) => LeaderExit::Code(code),
+            WaitStatus::Signaled(_, signal, _) => LeaderExit::Signal(signal as i32),
+            _ => return LeaderState::Running,
+        };
+        self.exit = Some(exit);
+        LeaderState::Exited(exit)
     }
 
     /// Reaps the leader after a stop; its status no longer matters.
@@ -65,7 +142,7 @@ impl ProcessGroup {
     // still runs in uninterruptible sleep, and oomwrap exits right after.
     #[cfg_attr(test, mutants::skip)]
     pub(crate) fn reap(&mut self) {
-        let _ = self.child.wait();
+        let _ = self.wait();
     }
 
     /// Tells whether any member of the group is still running.
@@ -75,19 +152,37 @@ impl ProcessGroup {
 
     /// Sends `SIGTERM` to the group, waits up to `term_grace`, then sends `SIGKILL`.
     pub(crate) fn terminate(&mut self, term_grace: Duration) -> Result<()> {
-        terminate_process_group(&mut self.child, self.pgid, term_grace)
+        terminate_process_group(self, term_grace)
+    }
+
+    /// Ends a launch that never started the command: `SIGKILL` to the group,
+    /// then waits for the leader.
+    pub(crate) fn kill(&mut self) {
+        let _ = signal_process_group(self.pgid, Signal::SIGKILL);
+        let _ = self.wait();
+    }
+
+    /// Continues a stopped job.
+    pub(crate) fn resume(&mut self) {
+        let _ = signal_process_group(self.pgid, Signal::SIGCONT);
+        self.stopped = false;
     }
 }
 
 // The integration suite covers TERM/KILL behavior with real child processes.
 // Sub-millisecond deadline boundary mutations here are noisy for cargo-mutants.
 #[cfg_attr(test, mutants::skip)]
-fn terminate_process_group(child: &mut Child, pgid: ProcessId, term_grace: Duration) -> Result<()> {
+fn terminate_process_group(group: &mut ProcessGroup, term_grace: Duration) -> Result<()> {
+    let pgid = group.pgid;
     let _ = signal_process_group(pgid, Signal::SIGTERM);
+    if group.stopped {
+        // A stopped process handles SIGTERM only once it runs again.
+        group.resume();
+    }
     let started = Instant::now();
     let mut seen_group = false;
     loop {
-        let _ = child.try_wait();
+        let _ = group.poll();
         let group_exists = process_group_exists(pgid);
         if group_exists {
             seen_group = true;
@@ -121,13 +216,13 @@ fn terminate_process_group(child: &mut Child, pgid: ProcessId, term_grace: Durat
     let _ = signal_process_group(pgid, Signal::SIGKILL);
     let kill_started = Instant::now();
     while kill_started.elapsed() < PROCESS_GROUP_KILL_WAIT {
-        let _ = child.try_wait();
+        let _ = group.poll();
         if !process_group_exists(pgid) {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.try_wait();
+    let _ = group.poll();
     Ok(())
 }
 
@@ -190,54 +285,99 @@ pub(crate) fn read_process_group_id(proc_dir: &Path) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::process::ExitStatusExt;
-
     use super::*;
 
-    /// Polls `try_wait` until the leader's status is known, for at most 3 s.
-    fn wait_for_exit(group: &mut ProcessGroup) -> Option<ExitStatus> {
+    fn sleeper(seconds: &str) -> ProcessGroup {
+        ProcessGroup::spawn(OsStr::new("sleep"), &[seconds.into()]).unwrap()
+    }
+
+    /// Polls the leader until it exits, for at most 3 s.
+    fn wait_for_exit(group: &mut ProcessGroup) -> Option<LeaderExit> {
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(3) {
-            if let Some(status) = group.try_wait().unwrap() {
-                return Some(status);
+            if let LeaderState::Exited(exit) = group.poll().unwrap() {
+                return Some(exit);
             }
             thread::sleep(Duration::from_millis(20));
         }
         None
     }
 
+    /// Never leaves the own child running when a check fails.
+    fn end(group: &mut ProcessGroup) {
+        let _ = signal_group(group.pgid, Signal::SIGKILL);
+        let _ = group.wait();
+    }
+
+    #[test]
+    fn process_group_members_are_only_the_own_child() {
+        let mut group = sleeper("30");
+        let members = process_group_member_pids(group.pgid).unwrap();
+        end(&mut group);
+        assert_eq!(members, vec![group.pgid]);
+        assert!(!process_group_exists(group.pgid));
+    }
+
     #[test]
     fn terminate_ends_the_own_child_group() {
-        let mut group = ProcessGroup::spawn(&["sleep".into(), "30".into()]).unwrap();
+        let mut group = sleeper("30");
         assert_eq!(
             i64::from(group.leader_pid()),
             i64::from(group.pgid().as_raw())
         );
         let terminated = group.terminate(Duration::from_millis(50));
-        let status = wait_for_exit(&mut group);
-        if status.is_none() {
-            // Never leave the own child running when the check fails.
-            let _ = group.child.kill();
-            let _ = group.child.wait();
+        let exit = wait_for_exit(&mut group);
+        if exit.is_none() {
+            end(&mut group);
         }
         terminated.unwrap();
-        let status = status.expect("the group must end after terminate");
-        assert_eq!(status.signal(), Some(Signal::SIGTERM as i32));
+        let exit = exit.expect("the group must end after terminate");
+        assert_eq!(exit, LeaderExit::Signal(Signal::SIGTERM as i32));
+        assert_eq!(exit.code(), 143);
         assert!(!group.has_members());
     }
 
     #[test]
-    fn process_group_members_are_only_the_own_child() {
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pgid = ProcessId::from_child_id(child.id()).unwrap();
-        let members = process_group_member_pids(pgid).unwrap();
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert_eq!(members, vec![pgid]);
-        assert!(!process_group_exists(pgid));
+    fn poll_reports_a_stop_once_and_resume_continues() {
+        let mut group = sleeper("30");
+        signal_group(group.pgid, Signal::SIGSTOP).unwrap();
+        let started = Instant::now();
+        let mut state = group.poll().unwrap();
+        while state == LeaderState::Running && started.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(5));
+            state = group.poll().unwrap();
+        }
+        let after = group.poll().unwrap();
+        let stopped = group.stopped;
+        group.resume();
+        let resumed = group.stopped;
+        end(&mut group);
+        assert_eq!(state, LeaderState::Stopped);
+        assert_eq!(after, LeaderState::Running);
+        assert!(stopped);
+        assert!(!resumed);
+    }
+
+    #[test]
+    fn exits_are_codes_or_signals() {
+        let mut group =
+            ProcessGroup::spawn(OsStr::new("sh"), &["-c".into(), "exit 7".into()]).unwrap();
+        assert_eq!(group.wait().unwrap(), LeaderExit::Code(7));
+        assert_eq!(
+            group.poll().unwrap(),
+            LeaderState::Exited(LeaderExit::Code(7))
+        );
+        assert_eq!(LeaderExit::Code(7).code(), 7);
+        assert_eq!(LeaderExit::Signal(9).code(), 137);
+    }
+
+    #[test]
+    fn kill_ends_and_reaps_the_own_launch() {
+        let mut group = sleeper("30");
+        group.kill();
+        assert_eq!(
+            group.poll().unwrap(),
+            LeaderState::Exited(LeaderExit::Signal(Signal::SIGKILL as i32))
+        );
     }
 }

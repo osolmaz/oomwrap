@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use nix::sys::signal::{Signal, kill, killpg};
+use nix::sys::signal::{Signal, kill, killpg, raise};
 use nix::unistd::Pid;
 
 /// A process ID or process group ID that oomwrap may signal.
@@ -80,6 +80,12 @@ pub(crate) fn signal_group(pgid: ProcessId, signal: Signal) -> nix::Result<()> {
 )]
 pub(crate) fn group_exists(pgid: ProcessId) -> nix::Result<()> {
     killpg(pgid.as_pid(), None)
+}
+
+/// Stops oomwrap itself with `SIGTSTP`, as a shell job stops on Ctrl-Z, and
+/// returns when the shell continues it. `raise` names no process ID.
+pub(crate) fn stop_self() -> nix::Result<()> {
+    raise(Signal::SIGTSTP)
 }
 
 #[cfg(test)]
