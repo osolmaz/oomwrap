@@ -74,6 +74,14 @@ pub(crate) struct MemoryEvents {
     pub(crate) oom_kill: u64,
 }
 
+/// Reads a cgroup's `memory.events`; a counter that is missing counts as 0.
+pub(crate) fn parse_memory_events(content: &str) -> Result<MemoryEvents> {
+    Ok(MemoryEvents {
+        oom: keyed_value(content, "oom")?.unwrap_or(0),
+        oom_kill: keyed_value(content, "oom_kill")?.unwrap_or(0),
+    })
+}
+
 /// Reads `key value` lines, as `memory.events` and `memory.stat` hold them.
 pub(crate) fn keyed_value(content: &str, key: &str) -> Result<Option<u64>> {
     for line in content.lines() {
@@ -256,6 +264,23 @@ Hugetlb:          2048 kB
         assert!(parse_meminfo("MemAvailable: 2 kB\n").is_err());
         assert!(parse_meminfo("MemTotal: x kB\nMemAvailable: 1 kB\n").is_err());
         assert!(parse_meminfo("MemTotal: 99999999999999999 kB\nMemAvailable: 1 kB\n").is_err());
+    }
+
+    #[test]
+    fn parses_memory_events() {
+        let events =
+            parse_memory_events("low 0\nhigh 12\nmax 3\noom 2\noom_kill 1\noom_group_kill 0\n")
+                .unwrap();
+        assert_eq!(
+            events,
+            MemoryEvents {
+                oom: 2,
+                oom_kill: 1
+            }
+        );
+        assert_eq!(parse_memory_events("").unwrap(), MemoryEvents::default());
+        assert!(parse_memory_events("oom x\n").is_err());
+        assert!(parse_memory_events("oom_kill\n").is_err());
     }
 
     #[test]

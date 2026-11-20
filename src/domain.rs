@@ -40,17 +40,25 @@ pub(crate) struct MemoryDomain {
     pub(crate) domain: Domain,
     /// Every cgroup with a `memory.max` on the caller's path, closest first.
     limited: Vec<String>,
+    /// The lowest `memory.max` on the path, also one above the machine's size.
+    lowest_max: Option<u64>,
     cgroup_root: Option<PathBuf>,
 }
 
 impl MemoryDomain {
+    /// The domain of a job that runs where oomwrap runs.
     pub(crate) fn find(host: &Host) -> Result<Self> {
+        Self::find_from(host, host.own_cgroup()?.as_deref())
+    }
+
+    /// The domain of a job in `cgroup`, or in a new cgroup below it.
+    pub(crate) fn find_from(host: &Host, cgroup: Option<&str>) -> Result<Self> {
         let machine_bytes = machine_size(host)?;
         let cgroup_root = host.cgroup_root()?;
         let mut limited = Vec::new();
         let mut smallest: Option<(u64, String)> = None;
-        if let (Some(root), Some(own)) = (&cgroup_root, host.own_cgroup()?) {
-            for path in self_and_ancestors(&own) {
+        if let (Some(root), Some(own)) = (&cgroup_root, cgroup) {
+            for path in self_and_ancestors(own) {
                 let Some(max) = read_cgroup_limit(root, &path, "memory.max")? else {
                     continue;
                 };
@@ -60,6 +68,7 @@ impl MemoryDomain {
                 limited.push(path);
             }
         }
+        let lowest_max = smallest.as_ref().map(|(bytes, _)| *bytes);
         let domain = match smallest {
             Some((bytes, path)) if bytes < machine_bytes => Domain::Cgroup { path },
             _ => Domain::Machine,
@@ -67,8 +76,14 @@ impl MemoryDomain {
         Ok(Self {
             domain,
             limited,
+            lowest_max,
             cgroup_root,
         })
+    }
+
+    /// The lowest `memory.max` of the cgroups on the path.
+    pub(crate) fn lowest_max(&self) -> Option<u64> {
+        self.lowest_max
     }
 
     /// Reads the size and pressure of the domain, and the smallest free room
@@ -312,6 +327,29 @@ mod tests {
         limit(&fake, "/same.slice", 16 * GIB, GIB, 0);
         let domain = MemoryDomain::find(&fake.host()).unwrap();
         assert_eq!(domain.domain, Domain::Machine);
+    }
+
+    #[test]
+    fn a_new_scope_has_the_domain_of_its_parent() {
+        let fake = FakeHost::new();
+        fake.meminfo(16 * GIB, 8 * GIB, 0);
+        fake.own_cgroup("/user.slice/session.scope");
+        limit(&fake, "/user.slice/session.scope", GIB, 0, 0);
+        limit(&fake, "/user.slice/manager/app.slice", 4 * GIB, 0, 0);
+        limit(&fake, "/user.slice", 32 * GIB, 0, 0);
+        let host = fake.host();
+        let scope = MemoryDomain::find_from(&host, Some("/user.slice/manager/app.slice")).unwrap();
+        assert_eq!(scope.domain, cgroup("/user.slice/manager/app.slice"));
+        assert_eq!(scope.lowest_max(), Some(4 * GIB));
+        let caller = MemoryDomain::find(&host).unwrap();
+        assert_eq!(caller.domain, cgroup("/user.slice/session.scope"));
+        assert_eq!(caller.lowest_max(), Some(GIB));
+        let nowhere = MemoryDomain::find_from(&host, None).unwrap();
+        assert_eq!(nowhere.domain, Domain::Machine);
+        assert_eq!(nowhere.lowest_max(), None);
+        let above_machine = MemoryDomain::find_from(&host, Some("/user.slice/x")).unwrap();
+        assert_eq!(above_machine.domain, Domain::Machine);
+        assert_eq!(above_machine.lowest_max(), Some(32 * GIB));
     }
 
     #[test]

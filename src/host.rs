@@ -9,6 +9,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
 use nix::sys::statvfs::statvfs;
+use nix::unistd::{SysconfVar, User, geteuid, getuid, sysconf};
 use serde::{Deserialize, Serialize};
 
 use crate::readings::{
@@ -22,6 +23,12 @@ const PROC_ROOT_VAR: &str = "OOMWRAP_PROC_ROOT";
 const CGROUP_ROOT_VAR: &str = "OOMWRAP_CGROUP_ROOT";
 /// Test seam: claims that a machine-wide guard is (`1`) or is not (`0`) active.
 const MACHINE_GUARD_VAR: &str = "OOMWRAP_MACHINE_GUARD_ACTIVE";
+/// Test seam: the program that starts a transient scope.
+const SYSTEMD_RUN_VAR: &str = "OOMWRAP_SYSTEMD_RUN";
+/// Test seam: the folder of the users with lingering on.
+const LINGER_DIR_VAR: &str = "OOMWRAP_LINGER_DIR";
+/// The page size when `sysconf` cannot tell it.
+const FALLBACK_PAGE_SIZE: u64 = 4096;
 
 pub(crate) struct Host {
     /// Where memory and cgroup readings come from; `/proc` outside tests.
@@ -39,6 +46,17 @@ pub(crate) struct Host {
     pub(crate) runtime_dir: Option<PathBuf>,
     /// The folder for temporary files, from `TMPDIR`.
     pub(crate) temp_dir: PathBuf,
+    /// The program that starts a transient scope; `systemd-run` outside tests.
+    pub(crate) systemd_run: PathBuf,
+    /// `/var/lib/systemd/linger`: one file per user with lingering on.
+    pub(crate) linger_dir: PathBuf,
+    pub(crate) uid: u32,
+    /// The name of the user, which names the user's lingering file.
+    pub(crate) user_name: Option<String>,
+    /// oomwrap runs as root and uses the system manager.
+    pub(crate) is_root: bool,
+    /// The page size, which is not 4 KiB on every machine.
+    pub(crate) page_size: u64,
 }
 
 impl Host {
@@ -63,7 +81,33 @@ impl Host {
             state_home: absolute_path_var("XDG_STATE_HOME"),
             runtime_dir: absolute_path_var("XDG_RUNTIME_DIR"),
             temp_dir: env::temp_dir(),
+            systemd_run: env::var_os(SYSTEMD_RUN_VAR)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("systemd-run")),
+            linger_dir: env::var_os(LINGER_DIR_VAR)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/var/lib/systemd/linger")),
+            uid: getuid().as_raw(),
+            user_name: User::from_uid(getuid())
+                .ok()
+                .flatten()
+                .map(|user| user.name),
+            is_root: geteuid().is_root(),
+            page_size: sysconf(SysconfVar::PAGE_SIZE)
+                .ok()
+                .flatten()
+                .and_then(|size| u64::try_from(size).ok())
+                .filter(|size| *size > 0)
+                .unwrap_or(FALLBACK_PAGE_SIZE),
         }
+    }
+
+    /// Tells whether lingering is on for the user, so that the user manager
+    /// outlives the user's last session.
+    pub(crate) fn lingering(&self) -> bool {
+        self.user_name
+            .as_ref()
+            .is_some_and(|name| self.linger_dir.join(name).exists())
     }
 
     /// `${XDG_STATE_HOME:-~/.local/state}`.
@@ -388,7 +432,19 @@ pub(crate) mod tests {
                 state_home: None,
                 runtime_dir: None,
                 temp_dir: self.dir.path().to_path_buf(),
+                systemd_run: PathBuf::from("/nonexistent/systemd-run"),
+                linger_dir: self.dir.path().join("linger"),
+                uid: 1000,
+                user_name: Some("user".to_string()),
+                is_root: false,
+                page_size: 4096,
             }
+        }
+
+        pub(crate) fn linger(&self) {
+            let dir = self.dir.path().join("linger");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("user"), "").unwrap();
         }
 
         pub(crate) fn host_without_cgroups(&self) -> Host {
@@ -506,6 +562,17 @@ pub(crate) mod tests {
         let runtime = fake.cgroup_root();
         host.runtime_dir = Some(runtime.clone());
         assert_eq!(host.control_parent(), runtime.as_path());
+    }
+
+    #[test]
+    fn lingering_is_a_file_named_after_the_user() {
+        let fake = FakeHost::new();
+        let mut host = fake.host();
+        assert!(!host.lingering());
+        fake.linger();
+        assert!(host.lingering());
+        host.user_name = None;
+        assert!(!host.lingering());
     }
 
     #[test]

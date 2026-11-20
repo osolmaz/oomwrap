@@ -16,4 +16,12 @@ exclude_re = [
     "process_group_id",
     "process_group_exists",
     "terminate_process_group",
+    # The cgroup backend: the members of a scope, and the stop sequence that
+    # signals them and writes cgroup.kill.
+    "scope_member",
+    "signal_scope",
+    "terminate_scope",
+    "kill_scope",
+    "write_cgroup_kill",
+    "is_own_scope_dir",
 ]

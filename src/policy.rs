@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::limits::{Pressure, PressureLimit, StopLimits};
-use crate::readings::{DomainReadings, Readings};
+use crate::readings::{DomainReadings, MemoryEvents, Readings};
 
 /// Why the guard stops a job, or refuses its launch.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -31,6 +31,13 @@ impl StopReason {
             Self::DomainPressure => "domain_pressure",
             Self::DomainFloor => "domain_floor",
         }
+    }
+}
+
+impl StopReason {
+    /// A reason that every guard of the domain sees at once.
+    pub(crate) fn is_domain(self) -> bool {
+        matches!(self, Self::DomainPressure | Self::DomainFloor)
     }
 }
 
@@ -81,13 +88,8 @@ impl Decision {
             now_ms,
         );
 
-        if let Some(job) = readings.job {
-            if job.events.oom > 0 {
-                return Self::Stop(StopReason::JobLimit);
-            }
-            if job.events.oom_kill > 0 {
-                return Self::Stop(StopReason::OutsideOomKill);
-            }
+        if let Some(reason) = readings.job.and_then(|job| kill_reason(&job.events)) {
+            return Self::Stop(reason);
         }
         if job_pressure_held {
             return Self::Stop(StopReason::JobPressure);
@@ -99,6 +101,20 @@ impl Decision {
             return Self::Stop(StopReason::DomainFloor);
         }
         Self::Continue
+    }
+}
+
+/// The reason when the kernel acted on the job: `oom` rose when the job
+/// reached its `memory.max`; `oom_kill` without `oom` means an
+/// out-of-memory killer outside the job's limit killed a job process. The
+/// job's scope is new, so any count above zero has risen.
+pub(crate) fn kill_reason(events: &MemoryEvents) -> Option<StopReason> {
+    if events.oom > 0 {
+        Some(StopReason::JobLimit)
+    } else if events.oom_kill > 0 {
+        Some(StopReason::OutsideOomKill)
+    } else {
+        None
     }
 }
 
@@ -123,6 +139,25 @@ fn holds_for(
 
 fn below_floor(domain: &DomainReadings, limits: &StopLimits) -> bool {
     domain.free_bytes < limits.min_free_bytes
+}
+
+/// The longest wait before a stop for a domain reason.
+pub(crate) const MAX_STAGGER: Duration = Duration::from_secs(2);
+
+/// How long a guard waits and reads again before it stops its job for a
+/// domain reason. Every guard of a domain sees the same numbers, so the job
+/// with the larger share of the domain's use waits less and stops first;
+/// the others usually see the condition end. A job whose use is not known
+/// waits the longest.
+pub(crate) fn stagger_delay(job_bytes: Option<u64>, domain: &DomainReadings) -> Duration {
+    let used = domain.size_bytes.saturating_sub(domain.free_bytes);
+    let Some(job) = job_bytes.filter(|_| used > 0) else {
+        return MAX_STAGGER;
+    };
+    let share_left = u128::from(used.saturating_sub(job.min(used)));
+    let max_ms = MAX_STAGGER.as_millis();
+    let wait_ms = max_ms * share_left / u128::from(used);
+    Duration::from_millis(u64::try_from(wait_ms).unwrap_or(u64::MAX))
 }
 
 /// The domain reason that refuses a launch now, if any: the floor, or a
@@ -196,6 +231,35 @@ mod tests {
             .iter()
             .map(|reading| Decision::evaluate(&limits(), reading, &mut window))
             .collect()
+    }
+
+    #[test]
+    fn only_domain_reasons_are_domain_reasons() {
+        assert!(StopReason::DomainFloor.is_domain());
+        assert!(StopReason::DomainPressure.is_domain());
+        assert!(!StopReason::JobLimit.is_domain());
+        assert!(!StopReason::OutsideOomKill.is_domain());
+        assert!(!StopReason::JobPressure.is_domain());
+    }
+
+    #[test]
+    fn the_larger_job_waits_less_before_a_domain_stop() {
+        // 16G domain with 4G free: 12G in use.
+        let busy = domain(4 * GIB, 0);
+        assert_eq!(stagger_delay(None, &busy), MAX_STAGGER);
+        assert_eq!(stagger_delay(Some(0), &busy), MAX_STAGGER);
+        assert_eq!(
+            stagger_delay(Some(3 * GIB), &busy),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            stagger_delay(Some(9 * GIB), &busy),
+            Duration::from_millis(500)
+        );
+        assert_eq!(stagger_delay(Some(12 * GIB), &busy), Duration::ZERO);
+        assert_eq!(stagger_delay(Some(20 * GIB), &busy), Duration::ZERO);
+        let idle = domain(16 * GIB, 0);
+        assert_eq!(stagger_delay(Some(GIB), &idle), MAX_STAGGER);
     }
 
     #[test]
