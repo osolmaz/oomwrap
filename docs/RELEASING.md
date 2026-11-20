@@ -1,18 +1,19 @@
 # Releasing oomwrap
 
-The crate name `oomwrap` was available on crates.io when this release process
-was prepared. Check it again before the first release because availability can
-change.
+A release publishes the crate to crates.io and attaches static Linux binaries
+to the GitHub release. The `Release` workflow does both after a GitHub release
+is published.
 
 ## One-time setup
 
-1. Create a crates.io API token that can publish `oomwrap`.
-2. Save it as the GitHub Actions secret `CARGO_REGISTRY_TOKEN` in
-   `osolmaz/oomwrap`.
-3. Keep the repository default branch set to `main`.
+The crate publishes with crates.io trusted publishing, so no API token is
+stored anywhere. In the crate settings on crates.io, a trusted publisher names
+the GitHub repository `osolmaz/oomwrap` and the workflow file `publish.yml`.
+The `crates-io` job of that workflow asks crates.io for a token that lasts 30
+minutes, publishes with it, and revokes it at the end of the job. A rename of
+`publish.yml` needs the same change in the crates.io settings.
 
-The workflow uses the token only through `cargo publish`. Do not add the token
-to the repository or release files.
+Keep the repository default branch set to `main`.
 
 ## Prepare a release
 
@@ -29,6 +30,10 @@ to the repository or release files.
    cargo package --list
    cargo publish --dry-run --locked
    ```
+
+   A pull request that changes `Cargo.toml`, `Cargo.lock`, `publish.yml` or
+   `.github/scripts` also runs the build and test jobs of the `Release`
+   workflow, so the musl binaries are tested before the release.
 
 4. Inspect the packaged crate under `target/package/` and confirm that the
    embedded `memory-safe-launch` skill works from the packaged source.
@@ -55,15 +60,26 @@ runner itself under memory pressure. Review its traces before they go into
 ## Publish
 
 Create and publish a GitHub Release from the exact `main` commit, with a tag
-that matches the Cargo version, such as `v0.1.0`.
+that matches the Cargo version, such as `v0.2.0`. Paste the version's section
+of `CHANGELOG.md` into the release notes.
 
-The `Publish crate` workflow then:
+The `Release` workflow then:
 
-- checks that the tag matches `Cargo.toml`;
-- checks that the tagged commit is on `main`;
-- refuses to replace an existing crates.io version;
-- runs the Rust checks and package verification;
-- publishes with `cargo publish --locked`.
+- checks that the tag matches `Cargo.toml`, that the tagged commit is on
+  `main`, and that crates.io has no such version;
+- builds `oomwrap` for `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl`, and checks that both are static;
+- runs `cargo test --workspace --all-targets` against each binary through
+  `OOMWRAP_TEST_BIN`, and checks that the tests left the file unchanged;
+- runs the real-system suite against the binaries on Ubuntu 22.04 and 24.04 of
+  both architectures, and in a container;
+- attaches `oomwrap-<version>-<arch>-linux-musl` and `SHA256SUMS` to the
+  release, with a build provenance attestation for each binary;
+- publishes the crate with `cargo publish --locked` and a short-lived token
+  from trusted publishing.
+
+When a job fails, nothing is published to crates.io. Fix the cause, delete the
+release and its tag, and publish the release again.
 
 Do not create a tag or GitHub Release until publication is explicitly
 authorized.

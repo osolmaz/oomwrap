@@ -632,6 +632,17 @@ reads 0.2.0 flags while it runs 0.1.0, or the reverse.
    them to the GitHub release with SHA-256 checksums and build provenance attestations. `cargo
    install` stays.
 
+   Phase 7 settled the details. The `Release` workflow takes the place of the old one in
+   `publish.yml`, the file that crates.io trusted publishing names, so one workflow checks the tag,
+   builds, tests, attaches and publishes, and nothing reaches crates.io when a binary fails. It
+   publishes with a short-lived token from trusted publishing, and no secret holds a token. `tests/cli.rs` also takes `OOMWRAP_TEST_BIN`, so the integration tests run
+   against the release file itself and not a second build of it; a checksum after the tests shows
+   that they left the file as built. The release binaries also run the real-system suite on the
+   phase 6 runner matrix and in a container on both architectures. A pull request that changes the
+   build runs the same build and test jobs, so the musl build is tested before a release. The
+   documents merge with phase 7, before the release exists, because the release needs every phase
+   on `main`; the skill therefore names the version it describes.
+
 ### Results of phase 6
 
 **The runner matrix.** The `Real system` workflow passed on all five jobs. The memory limit column
