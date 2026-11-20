@@ -5,7 +5,8 @@
 # and kill(2) then signals the caller's own process group or every process of
 # the user who runs the tests. One mutant of process_group_member_pids that
 # returned [-1] did exactly that. These functions are covered by unit tests and
-# by the integration suite instead. Run mutation tests of the rest on CI.
+# by the integration suite instead. Mutation tests are optional: run the rest
+# only through the manual `Mutation tests` workflow, never on a workstation.
 exclude_globs = ["src/signal.rs"]
 exclude_re = [
     "ProcessId",
