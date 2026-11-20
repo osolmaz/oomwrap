@@ -33,8 +33,9 @@ to the repository or release files.
 4. Inspect the packaged crate under `target/package/` and confirm that the
    embedded `memory-safe-launch` skill works from the packaged source.
 
-   Mutation tests are optional and are not part of a release. The manual
-   `Mutation tests` workflow exists for a run that the maintainer asks for.
+   Mutation tests are optional and are not part of a release. The `mutants`
+   job of CI runs only on a manual dispatch with the `mutants` input, for a
+   run that the maintainer asks for.
 5. Merge or push the release commit to `main` and wait for CI to pass.
 
 ## Publish

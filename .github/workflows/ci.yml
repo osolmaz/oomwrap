@@ -2,6 +2,11 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      mutants:
+        description: Also run the optional mutation tests of the changed lines
+        type: boolean
+        default: false
   pull_request:
   push:
     branches:
@@ -52,3 +57,31 @@ jobs:
           checker: rs
           version: ${{ env.SLOPHAMMER_VERSION }}
           args: check .
+
+  # Optional. Mutation tests are not part of CI, of a finished change or of a
+  # release. This job runs only on a manual dispatch with the `mutants` input,
+  # on a throwaway runner, because a mutant of code that sends signals can
+  # reach processes that the tests did not start; `.cargo/mutants.toml` keeps
+  # cargo-mutants out of the functions that choose signal targets.
+  mutants:
+    if: github.event_name == 'workflow_dispatch' && inputs.mutants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Mutation test changed lines
+        run: |
+          git diff --unified=0 origin/main...HEAD > mutation.diff || git diff --unified=0 HEAD~1...HEAD > mutation.diff
+          cargo mutants --workspace --in-diff mutation.diff --timeout 60 --caught --unviable
+      - name: Keep the mutation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants.out
+          path: mutants.out
+          if-no-files-found: ignore

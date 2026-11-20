@@ -429,7 +429,8 @@ phase 2 the maintainer made them optional: the runs were slow, two of them ended
 the unit, integration and coverage checks already gate each change.) Mutation tests never run on
 a workstation over code that sends signals, kills processes, writes `cgroup.kill` or calls
 `systemd-run`: a mutant there can reach processes that the tests did not start. A requested run
-uses the manual `Mutation tests` workflow, on a throwaway runner. Locally, only pure modules are
+uses the `mutants` job of the CI workflow, which runs only on a manual dispatch with the
+`mutants` input, on a throwaway runner. Locally, only pure modules are
 mutated, file by file. A test signals only processes that it started, and
 creates and removes only its own `oomwrap-` scopes.
 
