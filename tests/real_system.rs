@@ -401,7 +401,9 @@ fn io_error(error: std::io::Error) -> String {
 
 /// The `cgroup` backend with a small scope: no case may take more.
 const CGROUP: &[&str] = &["--backend", "cgroup", "--memory-max", "256M"];
-/// A scope that an allocation of 200 MiB fills.
+/// A scope that an allocation of 200 MiB fills. Only the kernel's kill may
+/// stop its job: on some kernels a job at its `memory.max` first stalls for
+/// a while, and the cases with this scope check the kill.
 const TINY_SCOPE: &[&str] = &[
     "--backend",
     "cgroup",
@@ -409,6 +411,8 @@ const TINY_SCOPE: &[&str] = &[
     "64M",
     "--memory-swap-max",
     "0",
+    "--job-pressure",
+    "100%",
 ];
 
 // ---- The host cases ----
@@ -418,7 +422,7 @@ const TINY_SCOPE: &[&str] = &[
 fn job_limit(suite: &Suite) -> Outcome {
     let run = suite.run("job_limit");
     let cmd = suite.helper_job(&run, TINY_SCOPE, &["alloc", "200", "60"]);
-    expect_run(cmd, 137, Duration::from_secs(60))?;
+    expect_run(cmd, 137, Duration::from_secs(90))?;
     run.expect("stopped", "/reason", "job_limit")
         .and_then(|()| run.scope_gone())
 }
@@ -432,7 +436,7 @@ fn setsid_daemon(suite: &Suite) -> Outcome {
         TINY_SCOPE,
         &["detach", pid_file.to_str().unwrap(), "200"],
     );
-    expect_run(cmd, 137, Duration::from_secs(60))?;
+    expect_run(cmd, 137, Duration::from_secs(90))?;
     let pid = fs::read_to_string(&pid_file).map_err(|error| format!("no daemon PID: {error}"))?;
     let proc_dir = PathBuf::from(format!("/proc/{}", pid.trim()));
     let ended = wait_until(Duration::from_secs(5), || !is_daemon(&proc_dir));
