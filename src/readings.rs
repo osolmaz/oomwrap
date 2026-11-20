@@ -151,24 +151,31 @@ pub(crate) fn parse_mountinfo(content: &str) -> Result<CgroupMounts> {
 /// mountinfo writes a space, tab, newline or backslash in a path as `\` and
 /// three octal digits.
 fn unescape_mount_path(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(index) = rest.find('\\') {
-        out.push_str(&rest[..index]);
-        let code = rest.get(index + 1..index + 4);
-        match code.and_then(|digits| u8::from_str_radix(digits, 8).ok()) {
+    // Each piece after a backslash is read once, so the loop always ends.
+    let mut pieces = text.split('\\');
+    let mut out = pieces.next().unwrap_or_default().to_string();
+    for piece in pieces {
+        match octal_byte(piece) {
             Some(byte) => {
                 out.push(char::from(byte));
-                rest = &rest[index + 4..];
+                out.push_str(&piece[3..]);
             }
             None => {
                 out.push('\\');
-                rest = &rest[index + 1..];
+                out.push_str(piece);
             }
         }
     }
-    out.push_str(rest);
     out
+}
+
+/// The byte of three octal digits at the start of `text`.
+fn octal_byte(text: &str) -> Option<u8> {
+    let digits = text.get(..3)?;
+    if !digits.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
+        return None;
+    }
+    u8::from_str_radix(digits, 8).ok()
 }
 
 /// Reads the process group ID, the fifth field of `/proc/<pid>/stat`.
@@ -318,6 +325,9 @@ Hugetlb:          2048 kB
         assert!(parse_mountinfo("broken line\n").is_err());
         assert!(parse_mountinfo("1 2 3 - cgroup2\n").is_err());
         assert_eq!(unescape_mount_path("a\\b"), "a\\b");
+        assert_eq!(unescape_mount_path("a\\+12b"), "a\\+12b");
+        assert_eq!(unescape_mount_path("a\\777"), "a\\777");
+        assert_eq!(unescape_mount_path("\\134\\011"), "\\\t");
         assert_eq!(unescape_mount_path("a\\0"), "a\\0");
     }
 
