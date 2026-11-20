@@ -280,19 +280,28 @@ impl FakeMachine {
 /// folder, so no test reads or writes the real home.
 fn cli() -> Command {
     let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let mut cmd = Command::cargo_bin("oomwrap").unwrap();
+    let mut cmd = oomwrap();
     cmd.env("XDG_STATE_HOME", tmp.join("state"))
         .env("XDG_CONFIG_HOME", tmp.join("config"))
         .env("OOMWRAP_SYSTEM_POLICY", tmp.join("no-system-policy.toml"));
     cmd
 }
 
+/// The binary under test: `OOMWRAP_TEST_BIN` when it is set, such as a
+/// release build, and the build of this test run otherwise.
+fn oomwrap_path() -> PathBuf {
+    std::env::var_os("OOMWRAP_TEST_BIN").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_oomwrap")),
+        PathBuf::from,
+    )
+}
+
+fn oomwrap() -> Command {
+    Command::new(oomwrap_path())
+}
+
 fn oomwrap_bin() -> String {
-    Command::cargo_bin("oomwrap")
-        .unwrap()
-        .get_program()
-        .to_string_lossy()
-        .into_owned()
+    oomwrap_path().to_string_lossy().into_owned()
 }
 
 fn wait_for_file(path: &Path) -> bool {
@@ -432,8 +441,7 @@ fn skillflag_lists_embedded_skill() {
 
 #[test]
 fn skillflag_shows_canonical_skill() {
-    let output = Command::cargo_bin("oomwrap")
-        .unwrap()
+    let output = oomwrap()
         .args(["--skill", "show", "memory-safe-launch"])
         .output()
         .unwrap();
@@ -448,8 +456,7 @@ fn skillflag_shows_canonical_skill() {
 
 #[test]
 fn skillflag_exports_complete_skill() {
-    let output = Command::cargo_bin("oomwrap")
-        .unwrap()
+    let output = oomwrap()
         .args(["--skill", "export", "memory-safe-launch"])
         .output()
         .unwrap();
@@ -2347,8 +2354,7 @@ fn the_holder_of_a_scope_stays_until_the_guard_releases_its_lock() {
     let lock_path = dir.path().join("oomwrap-generic-1.lock");
     let lock = fs::File::create(&lock_path).unwrap();
     lock.try_lock().unwrap();
-    let output = Command::cargo_bin("oomwrap")
-        .unwrap()
+    let output = oomwrap()
         .args(["hold-scope", "--lock"])
         .arg(&lock_path)
         .output()
@@ -2374,7 +2380,7 @@ fn the_holder_of_a_scope_stays_until_the_guard_releases_its_lock() {
     drop(lock);
     wait_for_process_exit(holder);
 
-    let mut gone = assert_cmd::Command::cargo_bin("oomwrap").unwrap();
+    let mut gone = assert_cmd::Command::new(oomwrap_path());
     gone.args(["hold-scope", "--stay", "--lock"])
         .arg(dir.path().join("missing.lock"))
         .timeout(Duration::from_secs(5))
