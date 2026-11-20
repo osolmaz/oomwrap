@@ -150,17 +150,12 @@ pub(crate) fn read_cgroup_limit(root: &Path, path: &str, file: &str) -> Result<O
 
 /// `/a/b` gives `/a/b`, `/a` and `/`.
 pub(crate) fn self_and_ancestors(path: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut current = path.trim_end_matches('/').to_string();
-    while !current.is_empty() {
-        paths.push(current.clone());
-        match current.rfind('/') {
-            Some(index) => current.truncate(index),
-            None => current.clear(),
-        }
-    }
-    paths.push("/".to_string());
-    paths
+    // A bounded loop over the path's parts: no change to it can loop forever.
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    (0..=parts.len())
+        .rev()
+        .map(|depth| format!("/{}", parts[..depth].join("/")))
+        .collect()
 }
 
 #[cfg(test)]
@@ -195,6 +190,8 @@ mod tests {
         assert_eq!(self_and_ancestors("/a/b"), ["/a/b", "/a", "/"]);
         assert_eq!(self_and_ancestors("/"), ["/"]);
         assert_eq!(self_and_ancestors("/a/"), ["/a", "/"]);
+        assert_eq!(self_and_ancestors("a//b"), ["/a/b", "/a", "/"]);
+        assert_eq!(self_and_ancestors(""), ["/"]);
     }
 
     #[test]
