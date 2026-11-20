@@ -1,7 +1,7 @@
 # Unified-memory inference recovery
 
 Use this runbook after a large local inference launch fails on a machine where
-the GPU and CPU share memory, such as NVIDIA GB10. Collect evidence before a GPU
+the GPU and CPU share memory. Collect evidence before a GPU
 reset or reboot. Driver allocation warnings and process watchdog events can
 occur during the same launch.
 
@@ -33,7 +33,9 @@ journalctl -u earlyoom --since '10 minutes ago' --no-pager
 
 `nvidia-smi` can report `Not Supported` for memory totals on a unified-memory
 system. Use `MemAvailable`, free swap, process RSS, server logs, oomwrap events,
-and watchdog logs together.
+and watchdog logs together. The job's cgroup does not count the GPU's
+allocations, so the scope's `memory.current` can be far below the memory that the
+model holds.
 
 An `NVRM: ... NV_ERR_NO_MEMORY` line does not prove that the driver terminated
 the launch. Some loaders continue after a failed allocation. An oomwrap pressure
@@ -45,9 +47,9 @@ proves a separate machine-wide watchdog action.
 A quantized model load can use much more memory than the ready server. Weight
 repacking is one example. Do not disable protection to pass this peak.
 
-1. Choose oomwrap floors from the measured machine budget.
+1. Choose the oomwrap floor (`--min-mem`) from the measured machine budget.
 2. Confirm that machine-wide `earlyoom` is active.
-3. Start the server with oomwrap and the same recorded floors.
+3. Start the server with oomwrap and the same recorded floor.
 4. Watch available RAM, free swap, the server log, and oomwrap events.
 5. Stop on pressure or a driver allocation failure.
 6. After readiness, confirm that steady-state headroom remains above the normal
@@ -56,7 +58,7 @@ repacking is one example. Do not disable protection to pass this peak.
 If the operator explicitly approves a bounded temporary `earlyoom` policy for a
 loading peak, keep a watchdog active throughout the change and restore the
 normal policy on success, failure, interruption, and timeout. Do not pass
-`--allow-no-earlyoom` for a large model load.
+`--allow-no-machine-guard` for a large model load.
 
 ## GPU reset approval
 
