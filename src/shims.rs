@@ -4,7 +4,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -117,16 +117,13 @@ pub(crate) fn selected_tools(tools: &[String]) -> Vec<String> {
     tools.to_vec()
 }
 
+/// Accepts only a name that is one plain path component, written as it is.
 pub(crate) fn validate_tool_name(tool: &str) -> Result<()> {
-    let path = Path::new(tool);
-    if tool.is_empty()
-        || path.is_absolute()
-        || path.components().count() != 1
-        || path.file_name().and_then(|name| name.to_str()) != Some(tool)
-    {
-        bail!("tool name must be a bare executable name: {tool}");
+    let mut components = Path::new(tool).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) if name == tool => Ok(()),
+        _ => bail!("tool name must be a bare executable name: {tool}"),
     }
-    Ok(())
 }
 
 pub(crate) fn default_bin_dir(host: &Host) -> Result<PathBuf> {
@@ -153,7 +150,7 @@ pub(crate) fn is_managed_absolute_wrapper(path: &Path) -> Result<bool> {
 }
 
 fn file_contains_marker(path: &Path, marker: &str) -> Result<bool> {
-    if !path.exists() || !path.is_file() {
+    if !path.is_file() {
         return Ok(false);
     }
     let content = fs::read_to_string(path).unwrap_or_default();
@@ -354,6 +351,10 @@ mod tests {
         assert!(validate_tool_name("../vllm").is_err());
         assert!(validate_tool_name("/tmp/vllm").is_err());
         assert!(validate_tool_name(".").is_err());
+        assert!(validate_tool_name("vllm/").is_err());
+        assert!(validate_tool_name("..").is_err());
+        assert!(validate_tool_name("/").is_err());
+        assert!(validate_tool_name("./vllm").is_err());
         assert!(disk_available(Path::new(".")).unwrap() > 1024 * 1024 * 1024);
         let default_bin = default_bin_dir(&host).unwrap();
         assert!(default_bin.ends_with(".local/bin"));
@@ -379,6 +380,40 @@ mod tests {
         fs::write(&wrapper, format!("# {ABSOLUTE_WRAPPER_MARKER}\n")).unwrap();
         assert!(is_managed_absolute_wrapper(&wrapper).unwrap());
         assert!(!is_managed_path_shim(&wrapper).unwrap());
+    }
+
+    #[test]
+    fn path_entry_errors_other_than_missing_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, "").unwrap();
+        assert!(path_entry_exists(&file).unwrap());
+        assert!(!path_entry_exists(&dir.path().join("missing")).unwrap());
+        // A path below a regular file fails with ENOTDIR, not with NotFound.
+        assert!(path_entry_exists(&file.join("child")).is_err());
+    }
+
+    #[test]
+    fn write_executable_skips_a_taken_temporary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = dir
+            .path()
+            .join(format!(".tool.oomwrap-tmp-{}-0", std::process::id()));
+        fs::write(&taken, "other").unwrap();
+        let path = dir.path().join("tool");
+        write_executable(&path, "#!/bin/sh\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "#!/bin/sh\n");
+        assert!(is_executable(&path).unwrap());
+        assert_eq!(fs::read_to_string(&taken).unwrap(), "other");
+    }
+
+    #[test]
+    fn write_executable_reports_a_missing_folder_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = write_executable(&dir.path().join("missing/tool"), "").unwrap_err();
+        let cause = error.root_cause().downcast_ref::<io::Error>();
+        assert_eq!(cause.map(io::Error::kind), Some(io::ErrorKind::NotFound));
+        assert!(format!("{error}").contains("failed to create"));
     }
 
     #[test]
