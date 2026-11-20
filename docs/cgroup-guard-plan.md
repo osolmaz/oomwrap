@@ -422,10 +422,15 @@ Smells of 0.1.0 that the split removes:
 Code that only the real-system suite can reach stays in thin adapters with a written reason for the
 mutation-test skip, as 0.1.0 does today.
 
-Mutation tests never run on a workstation over code that sends signals, kills processes, writes
-`cgroup.kill` or calls `systemd-run`: a mutant there can reach processes that the tests did not
-start. They run on CI, on a throwaway runner (`workflow_dispatch` of the CI workflow). Locally,
-only pure modules are mutated, file by file. A test signals only processes that it started, and
+Mutation tests are optional. They are not part of CI, of a finished phase or of the release: a
+phase is finished when the checks of `AGENTS.md` pass, with line coverage of at least 85%, and CI
+is green. (The first version of this plan required a mutation run on CI for each phase. During
+phase 2 the maintainer made them optional: the runs were slow, two of them ended canceled, and
+the unit, integration and coverage checks already gate each change.) Mutation tests never run on
+a workstation over code that sends signals, kills processes, writes `cgroup.kill` or calls
+`systemd-run`: a mutant there can reach processes that the tests did not start. A requested run
+uses the manual `Mutation tests` workflow, on a throwaway runner. Locally, only pure modules are
+mutated, file by file. A test signals only processes that it started, and
 creates and removes only its own `oomwrap-` scopes.
 
 ## Phases
