@@ -12,7 +12,9 @@ executable() {
   jq -r --arg name "$1" 'select(.target.name == $name and .executable != null) | .executable'
 }
 
+# The copy comes before the test build, which can build the binary again
+# with the features of the dev-dependencies.
 oomwrap="$(cargo build "$@" --locked --bin oomwrap --message-format=json | executable oomwrap)"
-suite="$(cargo test "$@" --locked --test real_system --no-run --message-format=json | executable real_system)"
 cp "$oomwrap" "$dist/oomwrap"
+suite="$(cargo test "$@" --locked --test real_system --no-run --message-format=json | executable real_system)"
 cp "$suite" "$dist/real_system"
