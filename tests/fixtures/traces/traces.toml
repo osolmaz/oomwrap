@@ -1,0 +1,71 @@
+# Traces of --record-readings, kept as they were recorded, and the decision
+# that each must get from the current policy and its defaults (see
+# src/policy/replay.rs). A change of the policy or of a default must keep
+# every decision, or change this file with its reason.
+#
+# A check without min-mem uses the default floor. min-mem = "0" turns the
+# floor off, so the check sees the pressure stops alone.
+
+[[trace]]
+file = "build-x86_64.jsonl"
+label = "build"
+recorded = "a release build of this crate, cgroup backend, GitHub-hosted runner, x86_64, 16 GiB"
+check = [{ expect = "continue" }, { min-mem = "0", expect = "continue" }]
+
+[[trace]]
+file = "build-aarch64.jsonl"
+label = "build"
+recorded = "a release build of this crate, cgroup backend, GitHub-hosted runner, aarch64, 16 GiB"
+check = [{ expect = "continue" }, { min-mem = "0", expect = "continue" }]
+
+[[trace]]
+file = "renderer-x86_64.jsonl"
+label = "renderer"
+recorded = "a headless browser that draws 48 large canvases, cgroup backend, GitHub-hosted runner, x86_64, 16 GiB"
+check = [{ expect = "continue" }, { min-mem = "0", expect = "continue" }]
+
+[[trace]]
+file = "model-load-aarch64.jsonl"
+label = "model load"
+recorded = "a 1.45 GiB model loaded into unified GPU memory and asked two questions, cgroup backend, aarch64"
+check = [{ expect = "continue" }, { min-mem = "0", expect = "continue" }]
+
+# A job that works on 2 GiB inside a scope with --memory-high 1G: it swaps
+# and stalls (the job reads up to 29%), but the domain has room. The
+# machine's pressure follows the job's stall (up to 22% at 86% free); it
+# does not count, because the machine is not short of memory.
+[[trace]]
+file = "scope-ramp-x86_64.jsonl"
+label = "memory ramp"
+recorded = "a job that writes to 2 GiB under --memory-high 1G, cgroup backend, GitHub-hosted runner, x86_64, 16 GiB"
+check = [{ expect = "continue" }, { min-mem = "0", expect = "continue" }]
+
+[[trace]]
+file = "scope-ramp-aarch64.jsonl"
+label = "memory ramp"
+recorded = "a job that writes to 2 GiB under --memory-high 1G, cgroup backend, GitHub-hosted runner, aarch64, 16 GiB"
+check = [{ expect = "continue" }, { min-mem = "0", expect = "continue" }]
+
+# The whole machine runs out of memory: a job takes the free room plus
+# 1 GiB, then writes to all of it for 60 s.
+[[trace]]
+file = "machine-ramp-x86_64.jsonl"
+label = "machine pressure"
+recorded = "a job that takes the free room plus 1 GiB, poll backend, GitHub-hosted runner, x86_64, 16 GiB, 4 GiB swap"
+check = [
+  # The free room falls below the floor of 2.4 GiB at 55 s.
+  { expect = "domain_floor", stop-between-s = [50, 60] },
+  # The machine thrashes from 66 s on; 10% holds for 10 s at 78 s.
+  { min-mem = "0", expect = "domain_pressure", stop-between-s = [70, 85] },
+]
+
+[[trace]]
+file = "machine-ramp-aarch64.jsonl"
+label = "machine pressure"
+recorded = "a job that takes the free room plus 1 GiB, poll backend, GitHub-hosted runner, aarch64, 16 GiB, 3 GiB swap"
+check = [
+  # The free room falls below the floor of 2.4 GiB at 52 s.
+  { expect = "domain_floor", stop-between-s = [45, 60] },
+  # The machine thrashes from 61 s on; 10% holds for 10 s at 73 s.
+  { min-mem = "0", expect = "domain_pressure", stop-between-s = [65, 80] },
+]

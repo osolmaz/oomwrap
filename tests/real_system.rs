@@ -40,11 +40,13 @@ const HOST_CASES: &[Case] = &[
     ("forwarded_signal", forwarded_signal),
     ("replaced_binary", replaced_binary),
     ("outer_scope_limit", outer_scope_limit),
+    ("launch_cost", launch_cost),
 ];
 
 const CONTAINER_CASES: &[Case] = &[
     ("container_auto", container_auto),
     ("container_floor", container_floor),
+    ("container_cache_room", container_cache_room),
 ];
 
 fn main() {
@@ -265,14 +267,8 @@ impl Suite {
 
     /// The same as [`Self::oomwrap`], with the oomwrap binary at `program`.
     fn oomwrap_from(&self, program: &Path, run: &Run, flags: &[&str]) -> Command {
-        let mut cmd = Command::new(program);
-        cmd.env("XDG_STATE_HOME", run.dir.join("state"))
-            .env("XDG_CONFIG_HOME", run.dir.join("config"))
-            .env(
-                "OOMWRAP_SYSTEM_POLICY",
-                run.dir.join("no-system-policy.toml"),
-            )
-            .args(["run", "--profile", "generic", "--allow-no-machine-guard"])
+        let mut cmd = Self::base(program, run);
+        cmd.args(["run", "--profile", "generic", "--allow-no-machine-guard"])
             .arg("--event-log")
             .arg(run.events())
             .args(flags);
@@ -283,6 +279,18 @@ impl Suite {
     fn helper_job(&self, run: &Run, flags: &[&str], args: &[&str]) -> Command {
         let mut cmd = self.oomwrap(run, flags);
         self.add_helper(&mut cmd, args);
+        cmd
+    }
+
+    /// oomwrap with the state and policy folders of `run`.
+    fn base(program: &Path, run: &Run) -> Command {
+        let mut cmd = Command::new(program);
+        cmd.env("XDG_STATE_HOME", run.dir.join("state"))
+            .env("XDG_CONFIG_HOME", run.dir.join("config"))
+            .env(
+                "OOMWRAP_SYSTEM_POLICY",
+                run.dir.join("no-system-policy.toml"),
+            );
         cmd
     }
 
@@ -332,6 +340,20 @@ impl Run {
             .unwrap_or_default();
         check(got == want, || {
             format!("{kind} {pointer} is {got:?}, not {want:?}: {event}")
+        })
+    }
+
+    /// Checks that one field of the first event of `kind` is one of
+    /// `wanted`, and prints it.
+    fn expect_one_of(&self, kind: &str, pointer: &str, wanted: &[&str]) -> Outcome {
+        let event = self.event(kind)?;
+        let got = event
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        println!("  {kind} {pointer}: {got}");
+        check(wanted.contains(&got), || {
+            format!("{kind} {pointer} is {got:?}, not one of {wanted:?}: {event}")
         })
     }
 
@@ -401,9 +423,10 @@ fn io_error(error: std::io::Error) -> String {
 
 /// The `cgroup` backend with a small scope: no case may take more.
 const CGROUP: &[&str] = &["--backend", "cgroup", "--memory-max", "256M"];
-/// A scope that an allocation of 200 MiB fills. Only the kernel's kill may
-/// stop its job: on some kernels a job at its `memory.max` first stalls for
-/// a while, and the cases with this scope check the kill.
+/// A scope that an allocation of 200 MiB fills. Linux 7.0 kills the job
+/// at the limit within seconds (`job_limit`); Linux 6.8 lets it stall at
+/// the limit for minutes without a kill, and the default `job_pressure`
+/// ends it after 30 s.
 const TINY_SCOPE: &[&str] = &[
     "--backend",
     "cgroup",
@@ -411,19 +434,20 @@ const TINY_SCOPE: &[&str] = &[
     "64M",
     "--memory-swap-max",
     "0",
-    "--job-pressure",
-    "100%",
 ];
+
+/// The reasons that end a job past its `memory.max`.
+const LIMIT_REASONS: &[&str] = &["job_limit", "job_pressure"];
 
 // ---- The host cases ----
 
-/// An allocation past `--memory-max 64M`: the kernel's kill, `job_limit`,
-/// exit 137, and no process left.
+/// An allocation past `--memory-max 64M`: exit 137 and no process left,
+/// after the kernel's kill or the stall at the limit.
 fn job_limit(suite: &Suite) -> Outcome {
     let run = suite.run("job_limit");
     let cmd = suite.helper_job(&run, TINY_SCOPE, &["alloc", "200", "60"]);
     expect_run(cmd, 137, Duration::from_secs(90))?;
-    run.expect("stopped", "/reason", "job_limit")
+    run.expect_one_of("stopped", "/reason", LIMIT_REASONS)
         .and_then(|()| run.scope_gone())
 }
 
@@ -437,6 +461,7 @@ fn setsid_daemon(suite: &Suite) -> Outcome {
         &["detach", pid_file.to_str().unwrap(), "200"],
     );
     expect_run(cmd, 137, Duration::from_secs(90))?;
+    run.expect_one_of("stopped", "/reason", LIMIT_REASONS)?;
     let pid = fs::read_to_string(&pid_file).map_err(|error| format!("no daemon PID: {error}"))?;
     let proc_dir = PathBuf::from(format!("/proc/{}", pid.trim()));
     let ended = wait_until(Duration::from_secs(5), || !is_daemon(&proc_dir));
@@ -684,4 +709,89 @@ fn container_floor(suite: &Suite) -> Outcome {
     );
     expect_run(cmd, 137, Duration::from_secs(60))?;
     run.expect("stopped", "/reason", "domain_floor")
+}
+
+/// The free room of a cgroup domain counts its inactive file pages, because
+/// the kernel reclaims them: after 400 MiB of file cache, a job can take
+/// the free room that oomwrap reports, more than `memory.max` minus
+/// `memory.current`, without an out-of-memory kill.
+fn container_cache_room(suite: &Suite) -> Outcome {
+    let run = suite.run("container_cache_room");
+    write_cache(&run.file("cache"), 400).map_err(io_error)?;
+    let reported = reported_free_mib(suite, &run)?;
+    let raw = cgroup_room_mib()?;
+    println!(
+        "cgroup domain: oomwrap reports {reported} MiB free; memory.max - memory.current is {raw} MiB"
+    );
+    check(reported > raw + 200, || {
+        "the file cache does not count as free room".to_string()
+    })?;
+    let take = (reported - 128).to_string();
+    let flags = ["--min-mem", "32M", "--poll", "200ms"];
+    expect_run(
+        suite.helper_job(&run, &flags, &["alloc", &take, "1"]),
+        0,
+        Duration::from_secs(60),
+    )
+}
+
+/// Writes `mib` MiB to a file in steps of 1 MiB, which leaves them in the
+/// page cache.
+fn write_cache(path: &Path, mib: usize) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = fs::File::create(path)?;
+    let block = vec![7_u8; MIB];
+    (0..mib).try_for_each(|_| file.write_all(&block))?;
+    file.sync_all()
+}
+
+/// The free room of the domain that `oomwrap doctor` reports, in MiB.
+fn reported_free_mib(suite: &Suite, run: &Run) -> Result<u64, String> {
+    let output = Suite::base(&suite.oomwrap, run)
+        .args(["doctor", "--json"])
+        .output()
+        .map_err(io_error)?;
+    let report: Value =
+        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
+    report["readings"]["free_bytes"]
+        .as_u64()
+        .map(|bytes| bytes >> 20)
+        .ok_or_else(|| format!("doctor reports no free room: {report}"))
+}
+
+/// `memory.max - memory.current` of the container, in MiB.
+fn cgroup_room_mib() -> Result<u64, String> {
+    let read = |name: &str| -> Result<u64, String> {
+        let text = fs::read_to_string(Path::new("/sys/fs/cgroup").join(name)).map_err(io_error)?;
+        text.trim()
+            .parse()
+            .map_err(|_| format!("{name} is {text:?}"))
+    };
+    Ok(read("memory.max")?.saturating_sub(read("memory.current")?) >> 20)
+}
+
+/// The cost of a launch: the median of 10 launches of `true` with each
+/// backend, printed for the plan. A `cgroup` launch adds a round trip to
+/// the service manager.
+fn launch_cost(suite: &Suite) -> Outcome {
+    let run = suite.run("launch_cost");
+    let cgroup = median_launch_ms(suite, &run, CGROUP)?;
+    let poll = median_launch_ms(suite, &run, &["--backend", "poll"])?;
+    println!("launch cost: cgroup {cgroup} ms, poll {poll} ms (median of 10)");
+    check(cgroup < 5000, || {
+        format!("a cgroup launch took {cgroup} ms")
+    })
+}
+
+fn median_launch_ms(suite: &Suite, run: &Run, flags: &[&str]) -> Result<u128, String> {
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let mut cmd = suite.oomwrap(run, flags);
+        cmd.args(["--", "true"]);
+        let started = Instant::now();
+        expect_code(run_bounded(&mut cmd, Duration::from_secs(30))?, 0)?;
+        times.push(started.elapsed().as_millis());
+    }
+    times.sort_unstable();
+    Ok(times[times.len() / 2])
 }

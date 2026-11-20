@@ -196,6 +196,9 @@ pub(crate) fn preflight(limits: &StopLimits, domain: &DomainReadings) -> Option<
 }
 
 #[cfg(test)]
+mod replay;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::readings::{JobReadings, MemoryEvents};

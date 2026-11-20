@@ -618,7 +618,7 @@ mod tests {
                 "90% of --memory-max",
                 "not set",
                 "15%, at least 256M, at most 16G",
-                "20.00%",
+                "10.00%",
                 "10s",
                 "60.00%",
                 "30s",
