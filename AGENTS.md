@@ -29,7 +29,8 @@ Run `slophammer-rs check .` when `slophammer-rs` is available locally.
   A mutant of such code can signal processes that the tests did not start; one
   mutant that returned the process ID -1 sent SIGTERM to every process of the
   user. `.cargo/mutants.toml` excludes the functions that choose signal
-  targets. A requested run uses the manual `Mutation tests` workflow, on a
-  throwaway runner; locally, mutate only pure modules with `--file`.
+  targets. A requested run uses the `mutants` job of `CI` (a manual dispatch
+  with the `mutants` input), on a throwaway runner; locally, mutate only pure
+  modules with `--file`.
 - A test signals only processes that it started itself, and creates and
   removes only its own transient scopes with the `oomwrap-` prefix.

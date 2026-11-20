@@ -16,9 +16,6 @@ rust:
       min_tokens: 100
   unsafe:
     policy: forbid
-  mutation:
-    targets:
-      - src
   dependency_boundaries:
     - from: .
       allow: []
