@@ -367,8 +367,8 @@ The events of schema version 1, as phase 3 made them:
 | `guard_error` | oomwrap could no longer guard the job and ended it | `detail` |
 
 Every event has `schema_version`, `unix_ms`, `event`, `backend`, `domain`, `program` (the file name
-of the program) and, after the launch, `pid`; in `cgroup`, `unit` and `cgroup`; `command` only with
-`--log-command`. Phase 4 added `cgroup_unavailable` and `job_limits` without a new schema version,
+of the program) and, after the launch, `pid`; in `cgroup`, `unit` and `cgroup`; `shim` when a shim
+or wrapper started the run (phase 5); `command` only with `--log-command`. Phase 4 added `cgroup_unavailable` and `job_limits` without a new schema version,
 because no release had version 1 yet. Fields without a
 value are left out. The day of a default log file is the UTC day, and a trace line is
 `{"readings": {...}, "decision": "continue"}` or `{"decision": {"stop": "<reason>"}}`.
@@ -387,18 +387,62 @@ value are left out. The day of a default log file is the UTC day, and a trace li
 - shims and wrappers that an earlier version made, which pass flags that 0.2.0 no longer has, with
   the command that writes them again.
 
+`doctor --profile <name>` resolves the settings of that profile (default `generic`), and `--json`
+gives the same report as data. A scope has lost its guard when nobody holds its lock: `doctor`
+tries a shared lock and lets it go at once. To find shims, `doctor` reads the first 4 KiB of each
+file in the folders of `PATH` and in `~/.local/bin`, where the marks of a script sit, so the scan
+stays cheap. `inspect` gives the binary, the default bin folder, the default tools, the policy
+files and the backend, and in `--json` the whole `doctor` report; its `default_*` fields of 0.1.0
+go, because the list of resolved settings replaces them. (Phase 5 added these details.)
+
 ### Configuration
 
 Every call site passes its own floors today, so one machine's policy is copied into each script,
 shim and wrapper. 0.2.0 reads one policy file: `/etc/oomwrap.toml`, then
-`~/.config/oomwrap/config.toml`, each with a section for each profile. Flags override the file. A
-value missing in all of them takes the defaults above.
+`${XDG_CONFIG_HOME:-~/.config}/oomwrap/config.toml`, each with a section for each profile. Flags
+override the file. A value missing in all of them takes the defaults above.
+
+```toml
+min-mem = "2G"
+machine-guards = ["my-guard"]
+
+[profile.vllm]
+memory-max = "80%"
+require-machine-guard = false
+```
+
+The keys are the flag names without their dashes in front: `backend`, `memory-max`,
+`memory-high`, `memory-swap-max`, `min-mem`, `domain-pressure`, `domain-pressure-for`,
+`job-pressure`, `job-pressure-for`, `poll`, `term-grace`, `require-machine-guard` and `event-log`.
+A size or a duration can also be a bare number (`0`, `30`). `machine-guards` names extra
+machine-wide guards by process name. `--log-command` and `--record-readings` stay flags, because
+they belong to one run. An unknown key, an unknown profile or a bad value stops the launch with
+exit 2 and names the file, the section and the key, so a typo never passes as a default.
+
+For each setting the first of these that sets it wins: the flag, the user file's profile
+section, the user file's top, the system file's profile section, the system file's top. (Phase 5
+fixed this order; the first version said only that flags override the file. The setting closest
+to the call counts most, so a user's file overrides the machine's without editing it.) `doctor`
+shows each value with the flag, the file and section, or the default that set it.
 
 Shims and wrappers carry no policy. Both are made by one generator and end in
 `exec oomwrap run --shim <tool> -- "$real" "$@"`, so a later change of flags or defaults never
 breaks an installed shim. `install-shims` and `wrap` rewrite a script that oomwrap made in place.
 From 0.2.0 on, oomwrap records each wrapped path in its state folder, so `doctor` can find wrappers
 outside `PATH`.
+
+Phase 5 settled the details. The `oomwrap` of the script is the binary that wrote it, or
+`OOMWRAP_BIN`; a PATH shim still takes `OOMWRAP_REAL_<TOOL>` to find its tool. Both variables say
+where a program is, not how to guard it. The variables `OOMWRAP_MIN_MEM`, `OOMWRAP_PROFILE`,
+`OOMWRAP_ALLOW_NO_MACHINE_GUARD` and `OOMWRAP_EVENT_LOG` of the scripts go, and so do the
+`--min-mem` flags of `install-shims` and `wrap`: they were policy in each script, which the
+policy file replaces. `--shim <tool>` tells `run` which tool's script started it: with
+`--profile auto`, the tool name gives the profile when the command shows none (a wrapper runs
+`<path>.real`), and the events carry `shim`. Each script holds the mark `oomwrap script 2`; a
+managed script without it comes from an earlier version, and `doctor` names the command that
+writes it again. The record is `${XDG_STATE_HOME:-~/.local/state}/oomwrap/wrapped-paths`, one
+absolute path per line; `wrap` adds to it, `unwrap` removes from it, and a failure to write it only
+warns.
 
 ### Code structure
 
@@ -449,7 +493,8 @@ Smells of 0.1.0 that the split removes:
   the false stop: full swap, free room, no pressure, no stop.
 - **Integration, in CI:** `OOMWRAP_PROC_ROOT` and `OOMWRAP_CGROUP_ROOT`, read once into `Host`,
   point at fake trees; they replace `OOMWRAP_MEMINFO_PATH`. `Host` names the `systemd-run` program
-  (`OOMWRAP_SYSTEMD_RUN`) and the lingering folder (`OOMWRAP_LINGER_DIR`), and CI uses a fake
+  (`OOMWRAP_SYSTEMD_RUN`), the lingering folder (`OOMWRAP_LINGER_DIR`) and the system policy file
+  (`OOMWRAP_SYSTEM_POLICY`), and CI uses a fake
   `systemd-run` that makes the scope in the fake tree and runs only what follows `--`. `exec-job`
   reads its cgroup through the proc root, so the fake scope can name it. The tests cover the handshake, `abort`, a
   launch that fails before the report, a failed exec, a signal during the handshake, a protocol

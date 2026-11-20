@@ -3,6 +3,7 @@
 //! Each line is built in memory and written with one `write` to a file opened
 //! for append, so the lines of concurrent jobs never mix.
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,16 @@ pub(crate) enum EventLog {
     Off,
     /// An explicit file; a failure to open it stops the launch.
     File(PathBuf),
+}
+
+impl fmt::Display for EventLog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => formatter.write_str("default"),
+            Self::Off => formatter.write_str("none"),
+            Self::File(path) => write!(formatter, "{}", path.display()),
+        }
+    }
 }
 
 impl FromStr for EventLog {
@@ -101,6 +112,9 @@ pub(crate) struct RunContext {
     /// The scope's cgroup path, in the `cgroup` backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cgroup: Option<String>,
+    /// The tool whose shim or wrapper started the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) shim: Option<String>,
 }
 
 impl RunContext {
@@ -394,6 +408,7 @@ mod tests {
 
     fn context() -> RunContext {
         RunContext {
+            shim: None,
             backend: BackendKind::Poll,
             domain: Domain::Machine,
             program: Some("true".into()),
